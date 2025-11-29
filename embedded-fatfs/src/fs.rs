@@ -334,6 +334,10 @@ where
     total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
+    #[cfg(feature = "fat-cache")]
+    pub(crate) fat_cache: RefCell<crate::fat_cache::FatCache>,
+    #[cfg(feature = "dir-cache")]
+    pub(crate) dir_cache: RefCell<crate::dir_cache::DirCache>,
 }
 
 /// The underlying storage device
@@ -414,6 +418,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
         // return FileSystem struct
         let status_flags = bpb.status_flags();
+        #[cfg(feature = "fat-cache")]
+        let sector_size = bpb.bytes_per_sector as u32;
         trace!("FileSystem::new end");
         Ok(Self {
             disk: RefCell::new(disk),
@@ -425,6 +431,10 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters,
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
+            #[cfg(feature = "fat-cache")]
+            fat_cache: RefCell::new(crate::fat_cache::FatCache::new(sector_size)),
+            #[cfg(feature = "dir-cache")]
+            dir_cache: RefCell::new(crate::dir_cache::DirCache::new()),
         })
     }
 
@@ -583,6 +593,14 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// Updates the FS Information Sector if needed and clears
     /// the dirty flag.
     pub async fn flush(&self) -> Result<(), Error<IO::Error>> {
+        // Flush FAT cache if enabled
+        #[cfg(feature = "fat-cache")]
+        {
+            let mut cache = self.fat_cache.borrow_mut();
+            let mut disk = self.disk.borrow_mut();
+            cache.flush(&mut *disk).await?;
+        }
+
         self.flush_fs_info().await?;
         self.set_dirty_flag(false).await?;
         Ok(())

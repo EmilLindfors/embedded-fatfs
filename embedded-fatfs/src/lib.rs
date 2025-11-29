@@ -75,6 +75,15 @@ mod io;
 mod table;
 mod time;
 
+#[cfg(feature = "fat-cache")]
+mod fat_cache;
+
+#[cfg(feature = "multi-cluster-io")]
+mod multi_cluster_io;
+
+#[cfg(feature = "dir-cache")]
+mod dir_cache;
+
 pub use crate::dir::*;
 pub use crate::dir_entry::*;
 pub use crate::error::*;

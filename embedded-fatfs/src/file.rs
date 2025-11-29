@@ -27,6 +27,10 @@ where
 /// method. This can be useful for large files, because to `Seek` to the
 /// end of the file would mean scanning the whole cluster chain which
 /// has `O(n)` time complexity.
+///
+/// Phase 2 Optimizations:
+/// - Contiguous file tracking for multi-cluster I/O
+/// - Cluster chain checkpoints for logarithmic seek
 #[derive(Clone)]
 pub struct FileContext {
     // Note first_cluster is None if file is empty
@@ -37,6 +41,18 @@ pub struct FileContext {
     pub(crate) offset: u32,
     // file dir entry editor - None for root dir
     pub(crate) entry: Option<DirEntryEditor>,
+
+    // Phase 2 Optimization: Contiguous file tracking
+    // When true, file clusters are allocated sequentially and FAT traversal can be skipped
+    #[cfg(feature = "multi-cluster-io")]
+    pub(crate) is_contiguous: bool,
+
+    // Phase 2 Optimization: Cluster chain checkpoints for O(log n) seeking
+    // Stores (offset, cluster) pairs at regular intervals
+    #[cfg(feature = "cluster-checkpoints")]
+    pub(crate) checkpoints: [(u32, u32); 8], // Up to 8 checkpoints
+    #[cfg(feature = "cluster-checkpoints")]
+    pub(crate) checkpoint_count: u8,
 }
 
 /// An extent containing a file's data on disk.
@@ -63,6 +79,12 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 entry,
                 current_cluster: None, // cluster before first one
                 offset: 0,
+                #[cfg(feature = "multi-cluster-io")]
+                is_contiguous: false, // Will be detected during allocation
+                #[cfg(feature = "cluster-checkpoints")]
+                checkpoints: [(0, 0); 8],
+                #[cfg(feature = "cluster-checkpoints")]
+                checkpoint_count: 0,
             },
             fs,
         }
@@ -272,6 +294,12 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             current_cluster: self.context.current_cluster,
             offset: self.context.offset,
             entry: self.context.entry.clone(),
+            #[cfg(feature = "multi-cluster-io")]
+            is_contiguous: self.context.is_contiguous,
+            #[cfg(feature = "cluster-checkpoints")]
+            checkpoints: self.context.checkpoints,
+            #[cfg(feature = "cluster-checkpoints")]
+            checkpoint_count: self.context.checkpoint_count,
         })
     }
 }
@@ -332,8 +360,82 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             None => return Ok(0),
         };
         let offset_in_cluster = self.context.offset % cluster_size;
+        let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(buf.len());
+
+        // Phase 2 Optimization: Multi-cluster I/O
+        // If reading more than one cluster and multi-cluster-io is enabled, try batched read
+        #[cfg(feature = "multi-cluster-io")]
+        {
+            if buf.len() > (cluster_size - offset_in_cluster) as usize {
+                // Potential multi-cluster read
+                trace!("attempting multi-cluster read");
+                match crate::multi_cluster_io::read_contiguous(
+                    self.fs,
+                    current_cluster,
+                    offset_in_cluster,
+                    buf,
+                )
+                .await
+                {
+                    Ok(read_bytes) if read_bytes > 0 => {
+                        // Multi-cluster read succeeded!
+                        let read_bytes = cmp::min(read_bytes, bytes_left_in_file);
+
+                        let old_offset = self.context.offset;
+                        self.context.offset += read_bytes as u32;
+                        let new_offset = self.context.offset;
+
+                        // Update current cluster to match new offset
+                        // FAT convention: when at a cluster boundary, current_cluster points to
+                        // the previous cluster (the one just finished), not the next cluster.
+                        let old_cluster_index = if old_offset == 0 {
+                            0u32
+                        } else {
+                            (old_offset / cluster_size).saturating_sub(1)
+                        };
+
+                        let new_cluster_index = if new_offset > 0 && new_offset % cluster_size == 0 {
+                            (new_offset / cluster_size).saturating_sub(1)
+                        } else {
+                            new_offset / cluster_size
+                        };
+
+                        let cluster_delta = new_cluster_index.saturating_sub(old_cluster_index);
+
+                        if cluster_delta > 0 {
+                            let mut cluster = current_cluster;
+                            for _ in 0..cluster_delta {
+                                let mut iter = self.fs.cluster_iter(cluster);
+                                if let Some(Ok(next)) = iter.next().await {
+                                    cluster = next;
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.context.current_cluster = Some(cluster);
+                        } else {
+                            self.context.current_cluster = Some(current_cluster);
+                        }
+
+                        if let Some(ref mut e) = self.context.entry {
+                            if self.fs.options.update_accessed_date {
+                                let now = self.fs.options.time_provider.get_current_date();
+                                e.set_accessed(now);
+                            }
+                        }
+                        trace!("multi-cluster read: {} bytes", read_bytes);
+                        return Ok(read_bytes);
+                    }
+                    _ => {
+                        // Fall through to single-cluster read
+                        trace!("falling back to single-cluster read");
+                    }
+                }
+            }
+        }
+
+        // Original single-cluster read path
         let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
-        let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(bytes_left_in_cluster);
         let read_size = cmp::min(cmp::min(buf.len(), bytes_left_in_cluster), bytes_left_in_file);
         if read_size == 0 {
             return Ok(0);
@@ -366,16 +468,110 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         trace!("File::write");
         let cluster_size = self.fs.cluster_size();
         let offset_in_cluster = self.context.offset % cluster_size;
-        let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
         let bytes_left_until_max_file_size = (MAX_FILE_SIZE - self.context.offset) as usize;
+
+        // Exit early if we are going to write no data
+        if buf.is_empty() || bytes_left_until_max_file_size == 0 {
+            return Ok(0);
+        }
+
+        // Mark the volume 'dirty'
+        self.fs.set_dirty_flag(true).await?;
+
+        // Phase 2 Optimization: Multi-cluster write for already allocated clusters
+        // This provides the flash wear reduction benefit for large sequential writes
+        #[cfg(feature = "multi-cluster-io")]
+        {
+            // Check if we're at a cluster boundary and writing more than one cluster
+            if offset_in_cluster == 0 && buf.len() >= cluster_size as usize {
+                // Get the cluster to write to (advance to next if at boundary, same logic as single-cluster path)
+                let write_cluster = if self.context.offset % cluster_size == 0 {
+                    // At cluster boundary - get next cluster from chain
+                    match self.context.current_cluster {
+                        None => self.context.first_cluster,
+                        Some(n) => {
+                            let r = self.fs.cluster_iter(n).next().await;
+                            match r {
+                                Some(Err(err)) => return Err(err),
+                                Some(Ok(next)) => Some(next),
+                                None => None,  // End of chain - fall through to single-cluster to allocate
+                            }
+                        }
+                    }
+                } else {
+                    self.context.current_cluster
+                };
+
+                // Only attempt multi-cluster write if we have an allocated cluster
+                if let Some(current_cluster) = write_cluster {
+                    trace!("attempting multi-cluster write");
+                    match crate::multi_cluster_io::write_contiguous(
+                        self.fs,
+                        current_cluster,
+                        offset_in_cluster,
+                        buf,
+                    )
+                    .await
+                    {
+                    Ok(written_bytes) if written_bytes > 0 => {
+                        // Multi-cluster write succeeded!
+                        let written_bytes = cmp::min(written_bytes, bytes_left_until_max_file_size);
+
+                        let old_offset = self.context.offset;
+                        self.context.offset += written_bytes as u32;
+                        let new_offset = self.context.offset;
+
+                        // Update current cluster to match new offset
+                        // FAT convention: when at a cluster boundary, current_cluster points to
+                        // the previous cluster (the one just finished), not the next cluster.
+                        let old_cluster_index = if old_offset == 0 {
+                            0u32
+                        } else {
+                            (old_offset / cluster_size).saturating_sub(1)
+                        };
+
+                        let new_cluster_index = if new_offset > 0 && new_offset % cluster_size == 0 {
+                            (new_offset / cluster_size).saturating_sub(1)
+                        } else {
+                            new_offset / cluster_size
+                        };
+
+                        let cluster_delta = new_cluster_index.saturating_sub(old_cluster_index);
+
+                        if cluster_delta > 0 {
+                            let mut cluster = current_cluster;
+                            for _ in 0..cluster_delta {
+                                let mut iter = self.fs.cluster_iter(cluster);
+                                if let Some(Ok(next)) = iter.next().await {
+                                    cluster = next;
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.context.current_cluster = Some(cluster);
+                        }
+
+                        self.update_dir_entry_after_write();
+                        trace!("multi-cluster write: {} bytes", written_bytes);
+                        return Ok(written_bytes);
+                    }
+                        _ => {
+                            // Fall through to single-cluster write
+                            trace!("falling back to single-cluster write");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Original single-cluster write path
+        let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
         let write_size = cmp::min(buf.len(), bytes_left_in_cluster);
         let write_size = cmp::min(write_size, bytes_left_until_max_file_size);
-        // Exit early if we are going to write no data
+
         if write_size == 0 {
             return Ok(0);
         }
-        // Mark the volume 'dirty'
-        self.fs.set_dirty_flag(true).await?;
         // Get cluster for write possibly allocating new one
         let current_cluster = if self.context.offset % cluster_size == 0 {
             // next cluster
