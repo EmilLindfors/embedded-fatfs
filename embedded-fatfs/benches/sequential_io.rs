@@ -12,9 +12,19 @@ use embedded_io_async::{Read, Write};
 async fn main() {
     println!("===== Embedded-FatFS Sequential I/O Benchmark =====\n");
 
+    //Create target directory if it doesn't exist
+    let _ = fs::create_dir_all("target").await;
+
     // Copy test image
-    fs::copy("../resources/fat32.img", "target/bench_fat32.img").await
-        .expect("Failed to copy test image");
+    match fs::copy("embedded-fatfs/resources/fat32.img", "target/bench_fat32.img").await {
+        Ok(_) => {},
+        Err(e) => {
+            eprintln!("Failed to copy from embedded-fatfs/resources/fat32.img: {}", e);
+            // Try alternative path
+            fs::copy("resources/fat32.img", "target/bench_fat32.img").await
+                .expect("Failed to copy test image from resources/fat32.img");
+        }
+    }
 
     // Benchmark sequential read
     benchmark_sequential_read().await;

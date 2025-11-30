@@ -297,6 +297,103 @@ pub struct CacheStatistics {
     pub hit_rate: f32,
 }
 
+/// Wrapper that routes all I/O through the FAT cache
+/// This integrates the cache into the FAT read/write path transparently
+#[cfg(feature = "fat-cache")]
+pub struct CachedFatSlice<'a, S>
+where
+    S: Read + Write + Seek + IoBase,
+{
+    inner: S,
+    cache: &'a core::cell::RefCell<FatCache>,
+    current_offset: u64,
+}
+
+#[cfg(feature = "fat-cache")]
+impl<'a, S> CachedFatSlice<'a, S>
+where
+    S: Read + Write + Seek + IoBase,
+{
+    pub fn new(inner: S, cache: &'a core::cell::RefCell<FatCache>) -> Self {
+        Self {
+            inner,
+            cache,
+            current_offset: 0,
+        }
+    }
+}
+
+#[cfg(feature = "fat-cache")]
+impl<S> IoBase for CachedFatSlice<'_, S>
+where
+    S: Read + Write + Seek + IoBase,
+{
+    // Pass through the error type from the inner storage (don't double-wrap)
+    type Error = S::Error;
+}
+
+#[cfg(feature = "fat-cache")]
+impl<S, E> Read for CachedFatSlice<'_, S>
+where
+    S: Read + Write + Seek + IoBase<Error = Error<E>>,
+    E: crate::error::IoError,
+{
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        // Read through cache - cache handles all error conversions
+        let mut cache = self.cache.borrow_mut();
+        cache.read_cached(&mut self.inner, self.current_offset, buf).await?;
+        self.current_offset += buf.len() as u64;
+        Ok(buf.len())
+    }
+}
+
+#[cfg(feature = "fat-cache")]
+impl<S, E> Write for CachedFatSlice<'_, S>
+where
+    S: Read + Write + Seek + IoBase<Error = Error<E>>,
+    E: crate::error::IoError,
+{
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        // Write through cache
+        let mut cache = self.cache.borrow_mut();
+        cache.write_cached(&mut self.inner, self.current_offset, buf).await?;
+        self.current_offset += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        cache.flush(&mut self.inner).await
+    }
+}
+
+#[cfg(feature = "fat-cache")]
+impl<S, E> Seek for CachedFatSlice<'_, S>
+where
+    S: Read + Write + Seek + IoBase<Error = Error<E>>,
+    E: crate::error::IoError,
+{
+    async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+        let new_offset = match pos {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(delta) => {
+                if delta >= 0 {
+                    self.current_offset + delta as u64
+                } else {
+                    self.current_offset.saturating_sub((-delta) as u64)
+                }
+            }
+            SeekFrom::End(_) => {
+                // For FAT slices, we don't know the end position
+                // This should not be used in practice
+                return Err(Error::InvalidInput);
+            }
+        };
+        self.current_offset = new_offset;
+        Ok(self.current_offset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

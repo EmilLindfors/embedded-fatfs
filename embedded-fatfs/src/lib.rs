@@ -84,6 +84,9 @@ mod multi_cluster_io;
 #[cfg(feature = "dir-cache")]
 mod dir_cache;
 
+#[cfg(feature = "cluster-bitmap")]
+mod cluster_bitmap;
+
 pub use crate::dir::*;
 pub use crate::dir_entry::*;
 pub use crate::error::*;

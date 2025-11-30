@@ -338,6 +338,8 @@ where
     pub(crate) fat_cache: RefCell<crate::fat_cache::FatCache>,
     #[cfg(feature = "dir-cache")]
     pub(crate) dir_cache: RefCell<crate::dir_cache::DirCache>,
+    #[cfg(feature = "cluster-bitmap")]
+    pub(crate) cluster_bitmap: RefCell<crate::cluster_bitmap::ClusterBitmap>,
 }
 
 /// The underlying storage device
@@ -421,7 +423,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         #[cfg(feature = "fat-cache")]
         let sector_size = bpb.bytes_per_sector as u32;
         trace!("FileSystem::new end");
-        Ok(Self {
+
+        let fs = Self {
             disk: RefCell::new(disk),
             options,
             fat_type,
@@ -435,7 +438,21 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             fat_cache: RefCell::new(crate::fat_cache::FatCache::new(sector_size)),
             #[cfg(feature = "dir-cache")]
             dir_cache: RefCell::new(crate::dir_cache::DirCache::new()),
-        })
+            #[cfg(feature = "cluster-bitmap")]
+            cluster_bitmap: RefCell::new(crate::cluster_bitmap::ClusterBitmap::new(total_clusters)),
+        };
+
+        // Build cluster bitmap from FAT (one-time cost at mount for 10-100x allocation speedup)
+        #[cfg(feature = "cluster-bitmap")]
+        {
+            trace!("Building cluster bitmap from FAT...");
+            let mut bitmap = fs.cluster_bitmap.borrow_mut();
+            let mut fat = fs.fat_slice();
+            bitmap.build_from_fat(&mut fat, fat_type, total_clusters).await?;
+            trace!("Cluster bitmap built: {} free clusters", bitmap.free_count());
+        }
+
+        Ok(fs)
     }
 
     /// Returns a type of File Allocation Table (FAT) used by this filesystem.
@@ -488,7 +505,18 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
     fn fat_slice(&self) -> impl ReadWriteSeek<Error = Error<IO::Error>> + '_ {
         let io = FsIoAdapter { fs: self };
-        fat_slice(io, &self.bpb)
+        let disk_slice = fat_slice(io, &self.bpb);
+
+        #[cfg(feature = "fat-cache")]
+        {
+            // Wrap with cache for automatic caching of all FAT operations
+            crate::fat_cache::CachedFatSlice::new(disk_slice, &self.fat_cache)
+        }
+
+        #[cfg(not(feature = "fat-cache"))]
+        {
+            disk_slice
+        }
     }
 
     pub(crate) fn cluster_iter(
@@ -508,8 +536,38 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 
     pub(crate) async fn free_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
+        // Collect clusters to free (for bitmap update)
+        #[cfg(feature = "cluster-bitmap")]
+        let mut clusters_to_free = {
+            #[cfg(all(feature = "alloc", not(feature = "std")))]
+            { alloc::vec::Vec::new() }
+            #[cfg(feature = "std")]
+            { std::vec::Vec::new() }
+        };
+
+        #[cfg(feature = "cluster-bitmap")]
+        {
+            // First, collect all clusters in the chain
+            let mut iter = self.cluster_iter(cluster);
+            while let Some(result) = iter.next().await {
+                let c = result?;
+                clusters_to_free.push(c);
+            }
+        }
+
+        // Free the cluster chain
         let mut iter = self.cluster_iter(cluster);
         let num_free = iter.free().await?;
+
+        // Update bitmap
+        #[cfg(feature = "cluster-bitmap")]
+        {
+            let mut bitmap = self.cluster_bitmap.borrow_mut();
+            for c in clusters_to_free {
+                bitmap.set_free(c);
+            }
+        }
+
         let mut fs_info = self.fs_info.borrow_mut();
         fs_info.map_free_clusters(|n| n + num_free);
         Ok(())
@@ -517,11 +575,39 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
     pub(crate) async fn alloc_cluster(&self, prev_cluster: Option<u32>, zero: bool) -> Result<u32, Error<IO::Error>> {
         trace!("alloc_cluster");
+
+        // Use cluster bitmap for fast allocation if enabled
+        #[cfg(feature = "cluster-bitmap")]
+        let hint = {
+            let mut bitmap = self.cluster_bitmap.borrow_mut();
+            let hint_from_fsinfo = self.fs_info.borrow().next_free_cluster
+                .unwrap_or(RESERVED_FAT_ENTRIES);
+
+            // Find free cluster using bitmap (O(1) average instead of O(n))
+            match bitmap.find_free(hint_from_fsinfo) {
+                Some(cluster) => Some(cluster),
+                None => {
+                    // Bitmap says disk is full
+                    return Err(Error::NotEnoughSpace);
+                }
+            }
+        };
+
+        #[cfg(not(feature = "cluster-bitmap"))]
         let hint = self.fs_info.borrow().next_free_cluster;
+
         let cluster = {
             let mut fat = self.fat_slice();
             alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters).await?
         };
+
+        // Update bitmap to mark cluster as allocated
+        #[cfg(feature = "cluster-bitmap")]
+        {
+            let mut bitmap = self.cluster_bitmap.borrow_mut();
+            bitmap.set_allocated(cluster);
+        }
+
         if zero {
             let mut disk = self.disk.borrow_mut();
             disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster))).await?;
@@ -586,6 +672,27 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub async fn unmount(self) -> Result<(), Error<IO::Error>> {
         self.flush().await
+    }
+
+    /// Get FAT cache statistics (hits, misses, hit rate)
+    ///
+    /// Only available when `fat-cache` feature is enabled.
+    /// Use this to verify cache effectiveness and tune cache size.
+    #[cfg(feature = "fat-cache")]
+    pub fn fat_cache_statistics(&self) -> crate::fat_cache::CacheStatistics {
+        self.fat_cache.borrow().statistics()
+    }
+
+    /// Get cluster bitmap statistics
+    ///
+    /// Returns statistics about the cluster bitmap including:
+    /// - Total/free/allocated cluster counts
+    /// - Volume utilization percentage
+    /// - Number of fast allocations performed
+    /// - Bitmap memory usage
+    #[cfg(feature = "cluster-bitmap")]
+    pub fn cluster_bitmap_statistics(&self) -> crate::cluster_bitmap::ClusterBitmapStatistics {
+        self.cluster_bitmap.borrow().statistics()
     }
 
     /// Flushes any in memory state to the filesystem

@@ -5,15 +5,25 @@
 
 use std::time::Instant;
 use tokio::fs;
-use embedded_io_async::{Read, Seek, SeekFrom};
+use embedded_io_async::{Read, Write, Seek, SeekFrom};
 
 #[tokio::main]
 async fn main() {
     println!("===== Embedded-FatFS Random Access Benchmark =====\n");
 
+    // Create target directory if it doesn't exist
+    let _ = fs::create_dir_all("target").await;
+
     // Copy test image
-    fs::copy("../resources/fat32.img", "target/bench_random.img").await
-        .expect("Failed to copy test image");
+    match fs::copy("embedded-fatfs/resources/fat32.img", "target/bench_random.img").await {
+        Ok(_) => {},
+        Err(e) => {
+            eprintln!("Failed to copy from embedded-fatfs/resources/fat32.img: {}", e);
+            // Try alternative path
+            fs::copy("resources/fat32.img", "target/bench_random.img").await
+                .expect("Failed to copy test image from resources/fat32.img");
+        }
+    }
 
     benchmark_random_access().await;
 
@@ -50,14 +60,14 @@ async fn benchmark_random_access() {
     let mut file = fs.root_dir().open_file("random_test.bin").await.unwrap();
     let mut buf = vec![0u8; 4096]; // 4KB reads
 
-    let iterations = 100;
+    let iterations = 100u32;
     let file_size = 10 * 1024 * 1024u64;
 
     let start = Instant::now();
 
     for i in 0..iterations {
         // Random offset (aligned to 4KB for consistency)
-        let offset = ((i * 12345) % (file_size / 4096)) * 4096;
+        let offset = ((i as u64 * 12345) % (file_size / 4096)) * 4096;
 
         file.seek(SeekFrom::Start(offset)).await.unwrap();
         file.read(&mut buf).await.unwrap();

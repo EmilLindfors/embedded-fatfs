@@ -6,26 +6,26 @@ use crate::error::{Error, IoError, ReadExactError};
 use crate::fs::{FatType, FsStatusFlags};
 use crate::io::{self, IoBase, Read, ReadLeExt, Seek, Write, WriteLeExt};
 
-struct Fat<S> {
+pub(crate) struct Fat<S> {
     phantom: PhantomData<S>,
 }
 
-type Fat12 = Fat<u8>;
-type Fat16 = Fat<u16>;
-type Fat32 = Fat<u32>;
+pub(crate) type Fat12 = Fat<u8>;
+pub(crate) type Fat16 = Fat<u16>;
+pub(crate) type Fat32 = Fat<u32>;
 
 pub const RESERVED_FAT_ENTRIES: u32 = 2;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum FatValue {
+pub(crate) enum FatValue {
     Free,
     Data(u32),
     Bad,
     EndOfChain,
 }
 
-trait FatTrait {
+pub(crate) trait FatTrait {
     async fn get_raw<S, E>(fat: &mut S, cluster: u32) -> Result<u32, Error<E>>
     where
         S: Read + Seek + IoBase,
