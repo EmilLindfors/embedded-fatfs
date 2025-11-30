@@ -30,6 +30,9 @@ pub enum Error<T> {
     InvalidFileNameLength,
     /// The provided file name contains an invalid character.
     UnsupportedFileNameCharacter,
+    /// File is locked by another reader or writer (requires `file-locking` feature).
+    #[cfg(feature = "file-locking")]
+    FileLocked,
 }
 
 impl<T> IoError for Error<T>
@@ -79,6 +82,8 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
             Error::NotFound => write!(f, "No such file or directory"),
             Error::AlreadyExists => write!(f, "File or directory already exists"),
             Error::CorruptedFileSystem => write!(f, "Corrupted file system"),
+            #[cfg(feature = "file-locking")]
+            Error::FileLocked => write!(f, "File is locked by another reader or writer"),
         }
     }
 }

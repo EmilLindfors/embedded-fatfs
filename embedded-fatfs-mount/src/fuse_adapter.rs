@@ -14,8 +14,8 @@ use fuser::{
     TimeOrNow,
 };
 
-use embedded_fatfs::{Dir, File, FileSystem as FatFileSystem};
-use log::{debug, error, trace, warn};
+use embedded_fatfs::{FileSystem as FatFileSystem, OemCpConverter, ReadWriteSeek, TimeProvider};
+use log::{debug, trace};
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
@@ -24,10 +24,13 @@ const ROOT_INODE: u64 = 1;
 ///
 /// This struct implements the FUSE Filesystem trait and delegates
 /// operations to the underlying embedded-fatfs implementation.
-pub struct FuseAdapter<IO, TP, OCC> {
+pub struct FuseAdapter<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter>
+where
+    IO::Error: 'static,
+{
     fs: FatFileSystem<IO, TP, OCC>,
-    /// Tokio runtime for executing async operations in sync FUSE context
-    runtime: tokio::runtime::Runtime,
+    /// Tokio runtime handle for executing async operations in sync FUSE context
+    runtime: tokio::runtime::Handle,
     /// Inode counter (FUSE requires unique inodes)
     next_inode: Arc<Mutex<u64>>,
     /// Map from inode to filesystem path
@@ -36,13 +39,12 @@ pub struct FuseAdapter<IO, TP, OCC> {
     path_to_inode: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
-impl<IO, TP, OCC> FuseAdapter<IO, TP, OCC> {
-    /// Create a new FUSE adapter
-    pub fn new(fs: FatFileSystem<IO, TP, OCC>) -> Self {
-        // Create tokio runtime for async bridge
-        let runtime = tokio::runtime::Runtime::new()
-            .expect("Failed to create tokio runtime for FUSE adapter");
-
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FuseAdapter<IO, TP, OCC>
+where
+    IO::Error: 'static,
+{
+    /// Create a new FUSE adapter with a runtime handle
+    pub fn new(fs: FatFileSystem<IO, TP, OCC>, runtime: tokio::runtime::Handle) -> Self {
         // Initialize inode mappings
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
@@ -79,7 +81,7 @@ impl<IO, TP, OCC> FuseAdapter<IO, TP, OCC> {
 
         // Store bidirectional mapping
         self.inode_to_path.lock().unwrap().insert(inode, path.clone());
-        self.path_to_inode.lock().unwrap().insert(path, inode);
+        self.path_to_inode.lock().unwrap().insert(path.clone(), inode);
 
         trace!("Allocated inode {} for path {:?}", inode, path);
         inode
@@ -105,7 +107,7 @@ impl<IO, TP, OCC> FuseAdapter<IO, TP, OCC> {
     }
 
     /// Convert FAT attributes to FUSE FileAttr
-    fn fat_to_fuse_attr(&self, ino: u64, entry: &embedded_fatfs::DirEntry) -> FileAttr {
+    fn fat_to_fuse_attr<'a>(&self, ino: u64, entry: &embedded_fatfs::DirEntry<'a, IO, TP, OCC>) -> FileAttr {
         let size = if entry.is_dir() {
             0
         } else {
@@ -120,7 +122,7 @@ impl<IO, TP, OCC> FuseAdapter<IO, TP, OCC> {
 
         // Convert FAT DateTime to SystemTime using chrono
         let fat_to_systemtime = |dt: embedded_fatfs::DateTime| -> SystemTime {
-            use chrono::{DateTime, NaiveDate, Timelike};
+            use chrono::{NaiveDate, Timelike};
 
             // Create a NaiveDateTime from FAT components
             let naive_date = NaiveDate::from_ymd_opt(
@@ -154,13 +156,17 @@ impl<IO, TP, OCC> FuseAdapter<IO, TP, OCC> {
         };
 
         // Get modification time
-        let mtime = entry.modified().map(fat_to_systemtime).unwrap_or(UNIX_EPOCH);
+        let mtime = fat_to_systemtime(entry.modified());
 
         // Get creation time (FAT supports this)
-        let crtime = entry.created().map(fat_to_systemtime).unwrap_or(mtime);
+        let crtime = fat_to_systemtime(entry.created());
 
         // Get access time (FAT has limited support - date only)
-        let atime = entry.accessed().map(fat_to_systemtime).unwrap_or(mtime);
+        // accessed() returns a Date, not DateTime, so we need to convert it
+        let accessed_date = entry.accessed();
+        let midnight = embedded_fatfs::Time::new(0, 0, 0, 0);
+        let accessed_datetime = embedded_fatfs::DateTime::new(accessed_date, midnight);
+        let atime = fat_to_systemtime(accessed_datetime);
 
         FileAttr {
             ino,
@@ -364,8 +370,9 @@ where
                 let mut current_offset = offset;
 
                 // Add . and .. entries (offset 0 and 1)
+                // Note: reply.add takes the offset for the NEXT entry
                 if current_offset == 0 {
-                    if reply.add(ino, 0, FileType::Directory, ".") {
+                    if reply.add(ino, 1, FileType::Directory, ".") {
                         reply.ok();
                         return;
                     }
@@ -374,7 +381,7 @@ where
 
                 if current_offset == 1 {
                     let parent_ino = ino; // TODO: track parent properly
-                    if reply.add(parent_ino, 1, FileType::Directory, "..") {
+                    if reply.add(parent_ino, 2, FileType::Directory, "..") {
                         reply.ok();
                         return;
                     }
@@ -537,7 +544,7 @@ where
             file.write_all(data).await?;
 
             // Flush to ensure data is written
-            file.flush().await?;
+            embedded_io_async::Write::flush(&mut file).await?;
 
             Ok::<usize, embedded_fatfs::Error<IO::Error>>(data.len())
         });
@@ -1000,7 +1007,7 @@ where
                 file.truncate().await?;
 
                 // Flush changes
-                file.flush().await?;
+                embedded_io_async::Write::flush(&mut file).await?;
 
                 // Get updated metadata
                 root.open_meta(path_str.trim_start_matches('/')).await

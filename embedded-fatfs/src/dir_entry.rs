@@ -653,6 +653,21 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         File::new(self.first_cluster(), Some(self.editor()), self.fs)
     }
 
+    /// Returns `File` struct for this entry with a lock held.
+    ///
+    /// This is used internally by locked file operations.
+    /// The caller must ensure the lock has been acquired before calling this.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if this is not a file.
+    #[cfg(feature = "file-locking")]
+    #[must_use]
+    pub(crate) fn to_file_locked(&self, lock_type: crate::file_locking::LockType) -> File<'a, IO, TP, OCC> {
+        assert!(!self.is_dir(), "Not a file entry");
+        File::new_with_lock(self.first_cluster(), Some(self.editor()), self.fs, lock_type)
+    }
+
     /// Returns `File` struct for this entry, resuming from an existing [`FileContext`].
     ///
     /// # Panics

@@ -18,6 +18,9 @@ where
     context: FileContext,
     // file-system reference
     fs: &'a FileSystem<IO, TP, OCC>,
+    // Lock type held by this file (if file-locking feature is enabled)
+    #[cfg(feature = "file-locking")]
+    lock_info: Option<crate::file_locking::LockType>,
 }
 
 /// A context of an existing [`File`].
@@ -87,6 +90,35 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 checkpoint_count: 0,
             },
             fs,
+            #[cfg(feature = "file-locking")]
+            lock_info: None,
+        }
+    }
+
+    /// Create a new file with a lock held.
+    /// This is used internally by locked file open operations.
+    #[cfg(feature = "file-locking")]
+    pub(crate) fn new_with_lock(
+        first_cluster: Option<u32>,
+        entry: Option<DirEntryEditor>,
+        fs: &'a FileSystem<IO, TP, OCC>,
+        lock_type: crate::file_locking::LockType,
+    ) -> Self {
+        File {
+            context: FileContext {
+                first_cluster,
+                entry,
+                current_cluster: None,
+                offset: 0,
+                #[cfg(feature = "multi-cluster-io")]
+                is_contiguous: false,
+                #[cfg(feature = "cluster-checkpoints")]
+                checkpoints: [(0, 0); 8],
+                #[cfg(feature = "cluster-checkpoints")]
+                checkpoint_count: 0,
+            },
+            fs,
+            lock_info: Some(lock_type),
         }
     }
 
@@ -100,7 +132,12 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     /// Prefer using [`DirEntry::try_to_file_with_context`](crate::dir_entry::DirEntry::try_to_file_with_context) where possible because
     /// it does some basic checks to avoid file corruption.
     pub(crate) fn new_from_context(context: FileContext, fs: &'a FileSystem<IO, TP, OCC>) -> Self {
-        File { context, fs }
+        File {
+            context,
+            fs,
+            #[cfg(feature = "file-locking")]
+            lock_info: None,
+        }
     }
 
     /// Truncate file in current position.
@@ -343,8 +380,17 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
     ///
     /// A [`FileContext`] is returned, which can be used in conjunction with the
     /// `to_file_with_context` API.
+    ///
+    /// **Note:** If this file was opened with a lock (using `open_file_locked` or
+    /// `create_file_locked`), use [`close_and_unlock`](Self::close_and_unlock) instead
+    /// to properly release the lock.
     #[allow(clippy::missing_errors_doc)]
     pub fn close(self) -> Result<FileContext, Error<IO::Error>> {
+        #[cfg(feature = "file-locking")]
+        if self.lock_info.is_some() {
+            warn!("Closing locked file without calling close_and_unlock - lock will not be released");
+        }
+
         Ok(FileContext {
             first_cluster: self.context.first_cluster,
             current_cluster: self.context.current_cluster,
@@ -357,6 +403,52 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             #[cfg(feature = "cluster-checkpoints")]
             checkpoint_count: self.context.checkpoint_count,
         })
+    }
+
+    /// Close the file and release any held lock.
+    ///
+    /// This should be used for files opened with `open_file_locked` or `create_file_locked`.
+    /// A [`FileContext`] is returned, which can be used to reopen the file.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let file = dir.open_file_locked("data.txt").await?;
+    /// // ... use file ...
+    /// let context = file.close_and_unlock().await?;
+    /// ```
+    #[cfg(feature = "file-locking")]
+    pub async fn close_and_unlock(self) -> Result<FileContext, Error<IO::Error>> {
+        // Release the lock if one was held
+        if let (Some(lock_type), Some(first_cluster)) = (self.lock_info, self.context.first_cluster) {
+            let mut locks = self.fs.file_locks.lock().await;
+            locks.unlock(first_cluster, lock_type);
+        }
+
+        Ok(FileContext {
+            first_cluster: self.context.first_cluster,
+            current_cluster: self.context.current_cluster,
+            offset: self.context.offset,
+            entry: self.context.entry.clone(),
+            #[cfg(feature = "multi-cluster-io")]
+            is_contiguous: self.context.is_contiguous,
+            #[cfg(feature = "cluster-checkpoints")]
+            checkpoints: self.context.checkpoints,
+            #[cfg(feature = "cluster-checkpoints")]
+            checkpoint_count: self.context.checkpoint_count,
+        })
+    }
+
+    /// Check if this file holds a lock.
+    #[cfg(feature = "file-locking")]
+    pub fn is_locked(&self) -> bool {
+        self.lock_info.is_some()
+    }
+
+    /// Get the lock type held by this file.
+    #[cfg(feature = "file-locking")]
+    pub fn lock_type(&self) -> Option<crate::file_locking::LockType> {
+        self.lock_info
     }
 }
 
@@ -375,11 +467,15 @@ impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
 }
 
 // Note: derive cannot be used because of invalid bounds. See: https://github.com/rust-lang/rust/issues/26925
+// Note: Cloning a file does NOT clone the lock - the cloned file is unlocked.
+// This is intentional to prevent lock reference counting issues.
 impl<IO: ReadWriteSeek, TP, OCC> Clone for File<'_, IO, TP, OCC> {
     fn clone(&self) -> Self {
         File {
             context: self.context.clone(),
             fs: self.fs,
+            #[cfg(feature = "file-locking")]
+            lock_info: None, // Clones don't inherit locks
         }
     }
 }

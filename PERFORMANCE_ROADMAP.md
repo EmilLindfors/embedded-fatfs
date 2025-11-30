@@ -1,6 +1,6 @@
 # Embedded-FatFS Performance Roadmap & Optimization Guide
 
-**Last Updated:** 2025-11-29
+**Last Updated:** 2025-11-30
 **Version:** 1.0
 **Status:** Research & Planning Phase
 
@@ -968,13 +968,508 @@ pub struct FileSystem {
 
 ---
 
-### Phase 5: Future Enhancements (Optional)
+### Phase 5: Concurrent Multicore Access (4-6 weeks)
+
+**Goal:** Enable safe concurrent access from multiple cores/tasks while maintaining no_std compatibility
+
+#### Overview
+
+Modern embedded systems increasingly feature multicore MCUs (RP2350, ESP32-S3, STM32H7 dual-core). The filesystem must support:
+
+1. **Multiple readers** - Concurrent read-only access to different files
+2. **Single writer** - Exclusive write access with reader exclusion
+3. **Shared metadata** - Safe concurrent access to FAT, directories, and caches
+4. **no_std first** - All primitives must work without std
+
+#### Current State Analysis
+
+**Already Thread-Safe:**
+- `async_lock::Mutex` on `disk`, `fs_info`, `fat_cache`, `dir_cache`, `cluster_bitmap`, `transaction_log`
+- These are `Send + Sync` when inner type is `Send`
+
+**Blocking Thread-Safety:**
+- `Cell<FsStatusFlags>` in `fs.rs:336` - NOT `Sync`, prevents `FileSystem` from being `Sync`
+- No file-level locking (declared in Cargo.toml but not implemented)
+- No explicit `Send + Sync` bounds on `FileSystem`
+
+**Required Changes:**
+1. Replace `Cell<FsStatusFlags>` with `async_lock::Mutex<FsStatusFlags>` or atomic
+2. Implement file-locking feature
+3. Add explicit `Send + Sync` bounds where appropriate
+4. Consider `RwLock` for read-heavy caches
+
+---
+
+#### Task 1: Thread-Safe Status Flags ⭐ CRITICAL ✅ DONE
+
+**Priority:** HIGHEST
+**Complexity:** Low
+**Impact:** Enables `FileSystem: Sync`
+
+##### Current Problem
+
+```rust
+// fs.rs:336 - Cell is NOT Sync!
+current_status_flags: Cell<FsStatusFlags>,
+```
+
+This single field prevents `FileSystem` from implementing `Sync`, blocking all multicore usage.
+
+##### Solution Options
+
+**Option A: Atomic Flags (Recommended for no_std)**
+```rust
+use core::sync::atomic::{AtomicU8, Ordering};
+
+pub struct FileSystem<IO, TP, OCC> {
+    // ...
+    /// Status flags encoded as atomic u8 (dirty: bit 0, io_error: bit 1)
+    current_status_flags: AtomicU8,
+}
+
+impl FsStatusFlags {
+    fn load(atomic: &AtomicU8) -> Self {
+        Self::decode(atomic.load(Ordering::Acquire))
+    }
+
+    fn store(&self, atomic: &AtomicU8) {
+        atomic.store(self.encode(), Ordering::Release);
+    }
+}
+```
+
+**Option B: Mutex (Consistent with existing pattern)**
+```rust
+use async_lock::Mutex;
+
+pub struct FileSystem<IO, TP, OCC> {
+    // ...
+    current_status_flags: Mutex<FsStatusFlags>,
+}
+```
+
+**Recommendation:** Option A (atomics) for minimal overhead on hot path.
+
+##### Code Locations
+- `fs.rs:336` - Change `Cell` to `AtomicU8`
+- `fs.rs:438` - Update initialization
+- All reads: `self.current_status_flags.load(Ordering::Acquire)`
+- All writes: Use `store` or compare-and-swap
+
+---
+
+#### Task 2: File-Level Locking ⭐⭐ HIGH ✅ DONE
+
+**Priority:** HIGH
+**Complexity:** Medium
+**Impact:** Prevents corruption from concurrent file access
+
+##### Design
+
+```rust
+/// Lock types for file access
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockType {
+    /// Multiple readers allowed
+    Shared,
+    /// Single writer, no readers
+    Exclusive,
+}
+
+/// File lock state
+pub struct FileLockState {
+    /// Number of shared readers (0 if exclusive lock held)
+    readers: u32,
+    /// True if exclusive lock is held
+    exclusive: bool,
+}
+
+/// File lock manager (stored in FileSystem)
+pub struct FileLockManager {
+    /// Maps first_cluster -> lock state
+    /// Using BTreeMap for no_std compatibility (no HashMap without std)
+    #[cfg(feature = "alloc")]
+    locks: BTreeMap<u32, FileLockState>,
+    #[cfg(not(feature = "alloc"))]
+    locks: heapless::FnvIndexMap<u32, FileLockState, 16>,
+}
+
+impl FileLockManager {
+    /// Attempt to acquire a lock
+    pub fn try_lock(&mut self, cluster: u32, lock_type: LockType) -> Result<(), Error> {
+        match self.locks.get_mut(&cluster) {
+            Some(state) => {
+                match lock_type {
+                    LockType::Shared => {
+                        if state.exclusive {
+                            return Err(Error::FileLocked);
+                        }
+                        state.readers += 1;
+                    }
+                    LockType::Exclusive => {
+                        if state.exclusive || state.readers > 0 {
+                            return Err(Error::FileLocked);
+                        }
+                        state.exclusive = true;
+                    }
+                }
+            }
+            None => {
+                let state = match lock_type {
+                    LockType::Shared => FileLockState { readers: 1, exclusive: false },
+                    LockType::Exclusive => FileLockState { readers: 0, exclusive: true },
+                };
+                self.locks.insert(cluster, state);
+            }
+        }
+        Ok(())
+    }
+
+    /// Release a lock
+    pub fn unlock(&mut self, cluster: u32, lock_type: LockType) {
+        if let Some(state) = self.locks.get_mut(&cluster) {
+            match lock_type {
+                LockType::Shared => {
+                    state.readers = state.readers.saturating_sub(1);
+                }
+                LockType::Exclusive => {
+                    state.exclusive = false;
+                }
+            }
+            // Remove entry if no locks held
+            if state.readers == 0 && !state.exclusive {
+                self.locks.remove(&cluster);
+            }
+        }
+    }
+}
+```
+
+##### Integration Points
+
+```rust
+// In FileSystem
+#[cfg(feature = "file-locking")]
+pub(crate) file_locks: Mutex<FileLockManager>,
+
+// In File::open (read mode)
+#[cfg(feature = "file-locking")]
+{
+    let mut locks = fs.file_locks.lock().await;
+    locks.try_lock(first_cluster, LockType::Shared)?;
+}
+
+// In File::open (write mode)
+#[cfg(feature = "file-locking")]
+{
+    let mut locks = fs.file_locks.lock().await;
+    locks.try_lock(first_cluster, LockType::Exclusive)?;
+}
+
+// In File::drop or explicit close
+#[cfg(feature = "file-locking")]
+{
+    // Note: async drop is tricky - may need explicit close() method
+    let mut locks = fs.file_locks.lock().await;
+    locks.unlock(first_cluster, self.lock_type);
+}
+```
+
+##### Error Type Addition
+
+```rust
+// In error.rs
+pub enum Error<E> {
+    // ... existing variants ...
+    /// File is locked by another reader/writer
+    #[cfg(feature = "file-locking")]
+    FileLocked,
+}
+```
+
+##### Code Locations
+- New file: `file_locking.rs`
+- `fs.rs` - Add `file_locks: Mutex<FileLockManager>` field
+- `file.rs` - Acquire lock on open, release on close
+- `error.rs` - Add `FileLocked` variant
+- `Cargo.toml` - Feature already declared
+
+---
+
+#### Task 3: RwLock for Read-Heavy Caches ⭐⭐ MEDIUM
+
+**Priority:** MEDIUM
+**Complexity:** Low
+**Impact:** Better concurrency for read operations
+
+##### Rationale
+
+Current design uses `Mutex` for all caches, but:
+- FAT cache is read-heavy (many lookups, few modifications)
+- Directory cache is read-heavy
+- Cluster bitmap has balanced read/write
+
+`RwLock` allows multiple concurrent readers, improving throughput on multicore.
+
+##### Design
+
+```rust
+use async_lock::RwLock;
+
+pub struct FileSystem<IO, TP, OCC> {
+    // ...
+    #[cfg(feature = "fat-cache")]
+    pub(crate) fat_cache: RwLock<crate::fat_cache::FatCache>,
+    #[cfg(feature = "dir-cache")]
+    pub(crate) dir_cache: RwLock<crate::dir_cache::DirCache>,
+    // cluster_bitmap stays Mutex (frequent writes during allocation)
+}
+```
+
+##### Usage Pattern
+
+```rust
+// Read path (fast, concurrent)
+let cache = fs.fat_cache.read().await;
+if let Some(entry) = cache.get(cluster) {
+    return Ok(entry);
+}
+drop(cache);
+
+// Write path (exclusive)
+let mut cache = fs.fat_cache.write().await;
+cache.insert(cluster, entry);
+```
+
+##### Code Locations
+- `fs.rs` - Change `Mutex` to `RwLock` for `fat_cache`, `dir_cache`
+- `fat_cache.rs` - Update all lock calls
+- `dir_cache.rs` - Update all lock calls
+- `table.rs` - Update FAT access patterns
+
+---
+
+#### Task 4: Explicit Send + Sync Bounds ⭐⭐ MEDIUM
+
+**Priority:** MEDIUM
+**Complexity:** Low
+**Impact:** API clarity and compile-time guarantees
+
+##### Design
+
+```rust
+// Ensure FileSystem is Send + Sync when IO is Send
+impl<IO, TP, OCC> FileSystem<IO, TP, OCC>
+where
+    IO: Read + Write + Seek + Send,
+    IO::Error: 'static,
+{
+    // All methods that require Send
+}
+
+// Static assertions
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn filesystem_is_send_sync() {
+        // With a Send storage backend, FileSystem should be Send + Sync
+        assert_send::<FileSystem<SendStorage, DefaultTimeProvider, DefaultOemCpConverter>>();
+        assert_sync::<FileSystem<SendStorage, DefaultTimeProvider, DefaultOemCpConverter>>();
+    }
+}
+```
+
+##### Documentation
+
+```rust
+/// A FAT filesystem object.
+///
+/// # Thread Safety
+///
+/// `FileSystem` is `Send + Sync` when the underlying storage `IO` is `Send`.
+/// This enables:
+/// - Sharing the filesystem across async tasks
+/// - Concurrent access from multiple cores
+/// - Use with work-stealing executors
+///
+/// ## Concurrent Access
+///
+/// Multiple operations can execute concurrently:
+/// - Reading different files (with `file-locking` feature)
+/// - Directory traversal
+/// - Metadata queries
+///
+/// Write operations are serialized through internal locking.
+///
+/// ## Feature: file-locking
+///
+/// Enable the `file-locking` feature for application-level file locking:
+/// - Shared locks for concurrent readers
+/// - Exclusive locks for writers
+/// - `Error::FileLocked` when lock unavailable
+```
+
+---
+
+#### Task 5: Async Runtime Considerations ⭐ MEDIUM
+
+**Priority:** MEDIUM
+**Complexity:** Research + Documentation
+**Impact:** Correct usage guidance for different runtimes
+
+##### Embassy (no_std)
+
+```rust
+// Embassy multicore example (RP2350)
+use embassy_executor::Spawner;
+use embassy_sync::mutex::Mutex;
+use static_cell::StaticCell;
+
+// FileSystem must be in static storage for cross-core sharing
+static FS: StaticCell<FileSystem<SpiStorage, ...>> = StaticCell::new();
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let fs = FS.init(FileSystem::new(storage, options).await.unwrap());
+
+    // Spawn tasks on different cores
+    spawner.spawn(reader_task(fs)).unwrap();
+    spawner.spawn(writer_task(fs)).unwrap();
+}
+
+#[embassy_executor::task]
+async fn reader_task(fs: &'static FileSystem<...>) {
+    let file = fs.root_dir().open_file("data.txt").await.unwrap();
+    // Read operations...
+}
+
+#[embassy_executor::task]
+async fn writer_task(fs: &'static FileSystem<...>) {
+    let file = fs.root_dir().create_file("log.txt").await.unwrap();
+    // Write operations...
+}
+```
+
+##### Tokio (std)
+
+```rust
+use std::sync::Arc;
+use tokio::task;
+
+#[tokio::main]
+async fn main() {
+    let fs = Arc::new(FileSystem::new(storage, options).await.unwrap());
+
+    let fs1 = fs.clone();
+    let reader = task::spawn(async move {
+        let file = fs1.root_dir().open_file("data.txt").await.unwrap();
+        // Read operations...
+    });
+
+    let fs2 = fs.clone();
+    let writer = task::spawn(async move {
+        let file = fs2.root_dir().create_file("log.txt").await.unwrap();
+        // Write operations...
+    });
+
+    tokio::join!(reader, writer);
+}
+```
+
+##### async-std
+
+```rust
+use async_std::sync::Arc;
+use async_std::task;
+
+fn main() {
+    task::block_on(async {
+        let fs = Arc::new(FileSystem::new(storage, options).await.unwrap());
+        // Similar to tokio...
+    });
+}
+```
+
+---
+
+#### Task 6: no_std Heapless Option ⭐ LOW
+
+**Priority:** LOW
+**Complexity:** Medium
+**Impact:** Concurrent access without alloc
+
+##### Design
+
+For ultra-constrained no_std environments without alloc:
+
+```rust
+/// Fixed-size file lock manager using heapless
+#[cfg(all(feature = "file-locking", not(feature = "alloc")))]
+pub struct FileLockManager<const N: usize = 8> {
+    locks: heapless::FnvIndexMap<u32, FileLockState, N>,
+}
+
+/// Cargo.toml
+[dependencies]
+heapless = { version = "0.8", optional = true }
+
+[features]
+file-locking-heapless = ["file-locking", "heapless"]
+```
+
+##### Trade-offs
+
+| Approach | Memory | Max Concurrent Files | Flexibility |
+|----------|--------|---------------------|-------------|
+| `alloc` (BTreeMap) | Dynamic | Unlimited | High |
+| `heapless` (N=8) | ~128 bytes | 8 | Low |
+| `heapless` (N=16) | ~256 bytes | 16 | Medium |
+
+---
+
+#### Success Criteria
+
+- [x] `FileSystem<IO, TP, OCC>: Send + Sync` when `IO: Send` ← **Completed!**
+- [x] File locking prevents concurrent write corruption ← **Completed!**
+- [ ] RwLock improves read concurrency by 2-4x
+- [ ] Works on Embassy multicore (RP2350, ESP32-S3)
+- [ ] Works with tokio multi-threaded runtime
+- [ ] Zero deadlocks in stress tests (10,000+ iterations)
+- [ ] Documentation with examples for each runtime
+- [ ] Benchmark: concurrent reads scale linearly with cores
+
+---
+
+#### Configuration
+
+```toml
+[features]
+# Concurrent access (requires no runtime changes)
+concurrent = []  # Just enables Send + Sync (default after Task 1)
+
+# File-level locking
+file-locking = ["alloc"]              # Requires alloc for BTreeMap
+file-locking-heapless = ["heapless"]  # no_std without alloc
+
+# Read-heavy optimization
+rwlock-caches = []  # Use RwLock instead of Mutex for caches
+```
+
+---
+
+### Phase 6: Future Enhancements (Optional)
 
 1. **exFAT Support** (separate crate?)
 2. **Write-ahead Journaling** (full ACID)
-3. **Parallel I/O** (multiple async tasks)
+3. **Parallel I/O** (multiple async tasks on same file)
 4. **Compression** (transparent file compression)
 5. **Encryption** (at-rest encryption)
+6. **Lock-free FAT cache** (for extreme concurrency)
 
 ---
 

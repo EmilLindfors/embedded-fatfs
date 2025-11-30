@@ -58,8 +58,7 @@ struct Args {
 }
 
 #[cfg(unix)]
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     // Setup logging
@@ -73,7 +72,7 @@ async fn main() -> Result<()> {
     info!("Mounting {} to {}", args.image.display(), args.mountpoint.display());
 
     if args.transaction_safe {
-        info!("Transaction safety: ENABLED ✓");
+        info!("Transaction safety: ENABLED");
     }
 
     // Verify image exists
@@ -89,36 +88,42 @@ async fn main() -> Result<()> {
         anyhow::bail!("Mount point is not a directory: {}", args.mountpoint.display());
     }
 
-    // Open the FAT image
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(!args.read_only)
-        .open(&args.image)
+    // Create a tokio runtime for initialization
+    let runtime = tokio::runtime::Runtime::new()
+        .context("Failed to create tokio runtime")?;
+
+    // Open the FAT image and create filesystem inside the runtime
+    let (fs, file_info) = runtime.block_on(async {
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(!args.read_only)
+            .open(&args.image)
+            .await
+            .with_context(|| format!("Failed to open image: {}", args.image.display()))?;
+
+        info!("Opened image file");
+
+        // Create filesystem
+        let fs = embedded_fatfs::FileSystem::new(
+            embedded_io_adapters::tokio_1::FromTokio::new(file),
+            embedded_fatfs::FsOptions::new(),
+        )
         .await
-        .with_context(|| format!("Failed to open image: {}", args.image.display()))?;
+        .context("Failed to mount FAT filesystem")?;
 
-    info!("Opened image file");
+        let fat_type = fs.fat_type();
+        let volume_label = String::from_utf8_lossy(fs.volume_label_as_bytes()).to_string();
 
-    // Create filesystem
-    let fs = embedded_fatfs::FileSystem::new(
-        embedded_io_adapters::tokio_1::FromTokio::new(file),
-        embedded_fatfs::FsOptions::new(),
-    )
-    .await
-    .context("Failed to mount FAT filesystem")?;
+        Ok::<_, anyhow::Error>((fs, (fat_type, volume_label)))
+    })?;
 
     info!("FAT filesystem mounted successfully");
-    info!("  FAT type: {:?}", fs.fat_type());
-    info!("  Volume label: {}", String::from_utf8_lossy(fs.volume_label_as_bytes()));
+    info!("  FAT type: {:?}", file_info.0);
+    info!("  Volume label: {}", file_info.1);
 
-    #[cfg(feature = "transaction-safe")]
-    if args.transaction_safe {
-        let stats = fs.transaction_statistics().await;
-        info!("  Transaction log: {} slots available", stats.total_slots);
-    }
-
-    // Create FUSE adapter
-    let fuse_fs = FuseAdapter::new(fs);
+    // Create FUSE adapter with the runtime handle
+    // The runtime must stay alive for the entire FUSE session
+    let fuse_fs = FuseAdapter::new(fs, runtime.handle().clone());
 
     info!("Starting FUSE mount...");
 
@@ -140,7 +145,14 @@ async fn main() -> Result<()> {
     info!("Filesystem mounted at {}", args.mountpoint.display());
     info!("Press Ctrl+C to unmount");
 
-    match fuser::mount2(fuse_fs, &args.mountpoint, &options) {
+    // fuser::mount2 blocks until the filesystem is unmounted
+    // The runtime must stay alive for the entire duration
+    let result = fuser::mount2(fuse_fs, &args.mountpoint, &options);
+
+    // Explicitly drop runtime after FUSE unmounts
+    drop(runtime);
+
+    match result {
         Ok(()) => {
             info!("Filesystem unmounted successfully");
             Ok(())

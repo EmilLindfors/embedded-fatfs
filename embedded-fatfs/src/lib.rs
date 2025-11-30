@@ -90,6 +90,9 @@ mod cluster_bitmap;
 #[cfg(feature = "transaction-safe")]
 mod transaction;
 
+#[cfg(feature = "file-locking")]
+mod file_locking;
+
 pub use crate::dir::*;
 pub use crate::dir_entry::*;
 pub use crate::error::*;
@@ -101,3 +104,6 @@ pub use crate::time::*;
 pub use crate::transaction::{
     TransactionEntry, TransactionLog, TransactionState, TransactionStatistics, TransactionType,
 };
+
+#[cfg(feature = "file-locking")]
+pub use crate::file_locking::{FileLockManager, FileLockState, LockType};

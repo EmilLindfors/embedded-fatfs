@@ -1,6 +1,6 @@
 use core::borrow::BorrowMut;
-use core::cell::Cell;
 use core::char;
+use core::sync::atomic::{AtomicU8, Ordering};
 use async_lock::Mutex;
 use core::cmp;
 use core::fmt::Debug;
@@ -333,7 +333,9 @@ where
     root_dir_sectors: u32,
     total_clusters: u32,
     fs_info: Mutex<FsInfoSector>,
-    current_status_flags: Cell<FsStatusFlags>,
+    /// Status flags stored as atomic u8 for thread safety (Send + Sync)
+    /// Bit 0: dirty, Bit 1: io_error
+    current_status_flags: AtomicU8,
     #[cfg(feature = "fat-cache")]
     pub(crate) fat_cache: Mutex<crate::fat_cache::FatCache>,
     #[cfg(feature = "dir-cache")]
@@ -342,6 +344,8 @@ where
     pub(crate) cluster_bitmap: Mutex<crate::cluster_bitmap::ClusterBitmap>,
     #[cfg(feature = "transaction-safe")]
     pub(crate) transaction_log: Mutex<crate::transaction::TransactionLog>,
+    #[cfg(feature = "file-locking")]
+    pub(crate) file_locks: Mutex<crate::file_locking::FileLockManager>,
 }
 
 /// The underlying storage device
@@ -435,7 +439,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             root_dir_sectors,
             total_clusters,
             fs_info: Mutex::new(fs_info),
-            current_status_flags: Cell::new(status_flags),
+            current_status_flags: AtomicU8::new(status_flags.encode()),
             #[cfg(feature = "fat-cache")]
             fat_cache: Mutex::new(crate::fat_cache::FatCache::new(sector_size)),
             #[cfg(feature = "dir-cache")]
@@ -449,6 +453,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
                 first_data_sector.saturating_sub(4), // Reserve 4 sectors before data area
                 4, // 4 sectors = 2KB for transaction log (supports 4 concurrent transactions)
             )),
+            #[cfg(feature = "file-locking")]
+            file_locks: Mutex::new(crate::file_locking::FileLockManager::new()),
         };
 
         // Build cluster bitmap from FAT (one-time cost at mount for 10-100x allocation speedup)
@@ -880,7 +886,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let mut flags = self.bpb.status_flags();
         flags.dirty |= dirty;
         // Check if flags has changed
-        let current_flags = self.current_status_flags.get();
+        let current_flags = FsStatusFlags::decode(self.current_status_flags.load(Ordering::Acquire));
         if flags == current_flags {
             // Nothing to do
             return Ok(());
@@ -897,7 +903,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         disk.seek(io::SeekFrom::Start(offset)).await?;
         disk.write_u8(encoded).await?;
         disk.flush().await?;
-        self.current_status_flags.set(flags);
+        self.current_status_flags.store(flags.encode(), Ordering::Release);
         Ok(())
     }
 
@@ -981,7 +987,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP
 /// `Drop` implementation tries to unmount the filesystem when dropping.
 impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
     fn drop(&mut self) {
-        if self.current_status_flags.get().dirty {
+        if FsStatusFlags::decode(self.current_status_flags.load(Ordering::Acquire)).dirty {
             warn!("Dropping FileSytem without unmount");
         }
     }
@@ -1584,4 +1590,63 @@ where
     storage.seek(SeekFrom::Start(0)).await?;
     trace!("format_volume end");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Static assertion helpers
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    // Mock storage type that implements Send
+    struct MockSendStorage;
+
+    impl crate::io::IoBase for MockSendStorage {
+        type Error = core::convert::Infallible;
+    }
+
+    impl crate::io::Read for MockSendStorage {
+        async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Ok(0)
+        }
+    }
+
+    impl crate::io::Write for MockSendStorage {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl crate::io::Seek for MockSendStorage {
+        async fn seek(&mut self, _pos: crate::io::SeekFrom) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+    }
+
+    // Verify that MockSendStorage is Send
+    #[test]
+    fn mock_storage_is_send() {
+        assert_send::<MockSendStorage>();
+    }
+
+    /// Verify FileSystem is Send when IO is Send
+    /// This enables sharing FileSystem across async tasks
+    #[test]
+    fn filesystem_is_send_when_io_is_send() {
+        assert_send::<FileSystem<MockSendStorage, DefaultTimeProvider, LossyOemCpConverter>>();
+    }
+
+    /// Verify FileSystem is Sync when IO is Send
+    /// This enables concurrent access from multiple cores/threads
+    /// Critical for multicore embedded systems (RP2350, ESP32-S3, STM32H7)
+    #[test]
+    fn filesystem_is_sync_when_io_is_send() {
+        assert_sync::<FileSystem<MockSendStorage, DefaultTimeProvider, LossyOemCpConverter>>();
+    }
 }

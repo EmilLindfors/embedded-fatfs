@@ -24,6 +24,16 @@ use aligned::Aligned;
 /// padding bytes when casting between blocks and slices.</div>
 ///
 /// This trait can be implemented multiple times to support various different block sizes.
+///
+/// # Thread Safety
+///
+/// This trait generates two variants via [`trait_variant::make`]:
+/// - [`BlockDevice`] - For single-threaded or `no_std` embedded contexts (no `Send` requirement)
+/// - [`SendBlockDevice`] - For multi-threaded contexts where futures must be `Send`
+///
+/// When using with async runtimes like tokio that require `Send` futures, use [`SendBlockDevice`]
+/// as your trait bound instead.
+#[trait_variant::make(SendBlockDevice: Send)]
 pub trait BlockDevice<const SIZE: usize> {
     /// The error type for the BlockDevice implementation.
     type Error: core::fmt::Debug;
@@ -49,30 +59,6 @@ pub trait BlockDevice<const SIZE: usize> {
     async fn size(&mut self) -> Result<u64, Self::Error>;
 }
 
-impl<T: BlockDevice<SIZE>, const SIZE: usize> BlockDevice<SIZE> for &mut T {
-    type Error = T::Error;
-    type Align = T::Align;
-
-    async fn read(
-        &mut self,
-        block_address: u32,
-        data: &mut [Aligned<Self::Align, [u8; SIZE]>],
-    ) -> Result<(), Self::Error> {
-        (*self).read(block_address, data).await
-    }
-
-    async fn write(
-        &mut self,
-        block_address: u32,
-        data: &[Aligned<Self::Align, [u8; SIZE]>],
-    ) -> Result<(), Self::Error> {
-        (*self).write(block_address, data).await
-    }
-
-    async fn size(&mut self) -> Result<u64, Self::Error> {
-        (*self).size().await
-    }
-}
 
 /// Cast a byte slice to an aligned slice of blocks.
 ///

@@ -379,6 +379,144 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         }
     }
 
+    /// Opens an existing file with a shared (read) lock.
+    ///
+    /// This method acquires a shared lock before opening the file, allowing multiple
+    /// concurrent readers but blocking writers. Use [`File::close_and_unlock`] to
+    /// properly release the lock when done.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::FileLocked` if the file is exclusively locked by another writer.
+    /// * `Error::NotFound` if `path` points to a non-existing directory entry.
+    /// * `Error::InvalidInput` if `path` points to a directory.
+    /// * `Error::Io` if the underlying storage object returned an I/O error.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let file = dir.open_file_locked("data.txt").await?;
+    /// // Multiple readers can access concurrently
+    /// let content = file.read_to_vec().await?;
+    /// file.close_and_unlock().await?;
+    /// ```
+    #[cfg(feature = "file-locking")]
+    pub async fn open_file_locked(&self, path: &str) -> Result<File<'a, IO, TP, OCC>, Error<IO::Error>> {
+        use crate::file_locking::LockType;
+
+        trace!("Dir::open_file_locked {}", path);
+
+        // First, find the entry to get the first cluster
+        let mut split = split_path(path);
+        let mut e = self.clone();
+        loop {
+            let (name, rest_opt) = split;
+            match rest_opt {
+                Some(rest) => {
+                    split = split_path(rest);
+                    e = e.find_entry(name, Some(true), None).await?.to_dir();
+                }
+                None => {
+                    let entry = e.find_entry(name, Some(false), None).await?;
+                    let first_cluster = entry.first_cluster();
+
+                    // Try to acquire shared lock
+                    if let Some(cluster) = first_cluster {
+                        let mut locks = self.fs.file_locks.lock().await;
+                        if locks.try_lock(cluster, LockType::Shared).is_err() {
+                            return Err(Error::FileLocked);
+                        }
+                    }
+
+                    // Create file using to_file and then set lock info
+                    return Ok(entry.to_file_locked(LockType::Shared));
+                }
+            }
+        }
+    }
+
+    /// Creates or opens a file with an exclusive (write) lock.
+    ///
+    /// This method acquires an exclusive lock before creating/opening the file,
+    /// blocking all other readers and writers. Use [`File::close_and_unlock`] to
+    /// properly release the lock when done.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::FileLocked` if the file is locked by another reader or writer.
+    /// * `Error::InvalidInput` if `path` points to a directory.
+    /// * `Error::InvalidFileNameLength` if the file name is empty or too long.
+    /// * `Error::UnsupportedFileNameCharacter` if the file name contains an invalid character.
+    /// * `Error::NotEnoughSpace` if there is not enough free space.
+    /// * `Error::Io` if the underlying storage object returned an I/O error.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut file = dir.create_file_locked("log.txt").await?;
+    /// file.write_all(b"Hello, World!").await?;
+    /// file.flush().await?;
+    /// file.close_and_unlock().await?;
+    /// ```
+    #[cfg(feature = "file-locking")]
+    pub async fn create_file_locked(&self, path: &str) -> Result<File<'a, IO, TP, OCC>, Error<IO::Error>> {
+        use crate::file_locking::LockType;
+
+        trace!("Dir::create_file_locked {}", path);
+
+        let mut split = split_path(path);
+        let mut e = self.clone();
+        loop {
+            let (name, rest_opt) = split;
+            match rest_opt {
+                Some(rest) => {
+                    split = split_path(rest);
+                    e = e.find_entry(name, Some(true), None).await?.to_dir();
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        // this is final filename in the path
+        let parent = e;
+        let (name, _) = split;
+        let r = parent.check_for_existence(name, Some(false)).await?;
+        match r {
+            // file does not exist - create it
+            DirEntryOrShortName::ShortName(short_name) => {
+                let sfn_entry = parent.create_sfn_entry(short_name, FileAttributes::from_bits_truncate(0), None);
+                let entry = parent.write_entry(name, sfn_entry).await?;
+                let first_cluster = entry.first_cluster();
+
+                // Try to acquire exclusive lock (new file, should always succeed)
+                if let Some(cluster) = first_cluster {
+                    let mut locks = self.fs.file_locks.lock().await;
+                    if locks.try_lock(cluster, LockType::Exclusive).is_err() {
+                        return Err(Error::FileLocked);
+                    }
+                }
+
+                Ok(entry.to_file_locked(LockType::Exclusive))
+            }
+            // file already exists - try to lock it exclusively
+            DirEntryOrShortName::DirEntry(entry) => {
+                let first_cluster = entry.first_cluster();
+
+                // Try to acquire exclusive lock
+                if let Some(cluster) = first_cluster {
+                    let mut locks = self.fs.file_locks.lock().await;
+                    if locks.try_lock(cluster, LockType::Exclusive).is_err() {
+                        return Err(Error::FileLocked);
+                    }
+                }
+
+                Ok(entry.to_file_locked(LockType::Exclusive))
+            }
+        }
+    }
+
     /// Creates new directory or opens existing.
     ///
     /// `path` is a '/' separated path relative to self directory.

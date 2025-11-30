@@ -132,6 +132,81 @@ This document tracks planned features, optimizations, and improvements for embed
 
 ---
 
+### Phase 5: Concurrent Multicore Access (4-6 weeks)
+
+**Goal:** Enable safe concurrent access from multiple cores/tasks while maintaining no_std compatibility
+
+#### Thread-Safe Status Flags ⭐ CRITICAL ✅ DONE
+**Priority:** Highest
+**Complexity:** Low
+**Impact:** Enables `FileSystem: Sync` for all multicore usage
+
+- [x] Replace `Cell<FsStatusFlags>` with `AtomicU8` in `fs.rs:338`
+- [x] Update initialization in `fs.rs:440`
+- [x] Update all status flag reads to use `Ordering::Acquire`
+- [x] Update all status flag writes to use `Ordering::Release`
+- [x] Add static assertion tests for `Send + Sync` bounds
+
+#### File-Level Locking ⭐⭐ HIGH ✅ DONE
+**Priority:** High
+**Complexity:** Medium
+**Use Case:** Prevent corruption from concurrent file access
+
+- [x] Create `file_locking.rs` module
+- [x] Implement `FileLockManager` with `BTreeMap<u32, FileLockState>`
+- [x] Add `LockType::Shared` (multiple readers) and `LockType::Exclusive` (single writer)
+- [x] Add `file_locks: Mutex<FileLockManager>` field to `FileSystem`
+- [x] Add `Dir::open_file_locked()` and `Dir::create_file_locked()` methods
+- [x] Add `File::close_and_unlock()` async method for lock release
+- [x] Add `Error::FileLocked` variant to `error.rs`
+- [x] Feature flag: `file-locking` (already declared)
+- [x] Tests: 8 unit tests for locking behavior
+
+#### RwLock for Read-Heavy Caches ⭐⭐ MEDIUM
+**Priority:** Medium
+**Complexity:** Low
+**Impact:** 2-4x better read concurrency on multicore
+
+- [ ] Change `fat_cache` from `Mutex` to `RwLock` in `fs.rs`
+- [ ] Change `dir_cache` from `Mutex` to `RwLock` in `fs.rs`
+- [ ] Update `fat_cache.rs` to use `read()`/`write()` pattern
+- [ ] Update `dir_cache.rs` to use `read()`/`write()` pattern
+- [ ] Update `table.rs` FAT access patterns
+- [ ] Benchmark read concurrency improvement
+
+#### Explicit Send + Sync Bounds ⭐⭐ MEDIUM
+**Priority:** Medium
+**Complexity:** Low
+**Impact:** API clarity and compile-time guarantees
+
+- [ ] Add `Send` bound to `IO` in relevant impl blocks
+- [ ] Add static assertion tests in `fs.rs` for `Send + Sync`
+- [ ] Document thread safety guarantees in `FileSystem` docstring
+- [ ] Add examples for `Arc<FileSystem>` usage pattern
+
+#### Async Runtime Documentation ⭐ MEDIUM
+**Priority:** Medium
+**Complexity:** Documentation only
+**Impact:** Correct usage guidance for different runtimes
+
+- [ ] Add Embassy multicore example (RP2350, ESP32-S3)
+- [ ] Add Tokio multi-threaded example with `Arc`
+- [ ] Add async-std example
+- [ ] Document `StaticCell` pattern for no_std multicore
+- [ ] Document potential deadlock scenarios and avoidance
+
+#### no_std Heapless Option ⭐ LOW
+**Priority:** Low
+**Complexity:** Medium
+**Use Case:** Concurrent access without alloc
+
+- [ ] Add `heapless` optional dependency
+- [ ] Implement `FileLockManager` using `heapless::FnvIndexMap`
+- [ ] Add `file-locking-heapless` feature flag
+- [ ] Document trade-offs (fixed max concurrent files)
+
+---
+
 ## 🔬 Research & Investigation
 
 ### exFAT Support
@@ -267,15 +342,29 @@ This document tracks planned features, optimizations, and improvements for embed
 - [ ] TRIM support
 - [ ] Extensive testing on real hardware
 
-### v1.0.0 (Stable)
+### v0.4.0 (Future)
 **Target:** Q3 2025
+**Focus:** Concurrent multicore access (no_std first)
+
+- [x] Thread-safe status flags (`Cell` → `AtomicU8`) ← **Completed!**
+- [x] File-level locking (shared/exclusive) ← **Completed!**
+- [ ] RwLock for read-heavy caches
+- [x] `FileSystem: Send + Sync` when `IO: Send` ← **Completed!**
+- [ ] Embassy multicore examples (RP2350, ESP32-S3)
+- [ ] Tokio multi-threaded examples
+- [ ] Concurrent access benchmarks
+- [ ] Deadlock prevention tests
+
+### v1.0.0 (Stable)
+**Target:** Q4 2025
 **Focus:** Production-ready
 
-- [ ] All Phase 1-4 features complete
+- [ ] All Phase 1-5 features complete
 - [ ] Zero known corruption bugs
 - [ ] 3+ production deployments
 - [ ] Complete documentation
 - [ ] Performance within 10% of targets
+- [ ] Concurrent access verified on multicore hardware
 
 ---
 
@@ -284,21 +373,22 @@ This document tracks planned features, optimizations, and improvements for embed
 Interested in helping? Here are high-impact areas:
 
 ### High Priority
-1. **Real Hardware Testing** - Test on actual SD cards, eMMC
-2. **Cluster Checkpoints** - Implement O(log n) seeking
-3. **Read-Ahead** - Implement prefetching engine
-4. **Benchmark Suite** - Expand with more scenarios
+1. **Thread-Safe Status Flags** - Replace `Cell` with `AtomicU8` for `Sync`
+2. **File-Level Locking** - Implement shared/exclusive locks
+3. **Real Hardware Testing** - Test on actual SD cards, eMMC
+4. **Cluster Checkpoints** - Implement O(log n) seeking
 
 ### Medium Priority
-1. **Directory Cache Integration** - Hook up existing cache
-2. **Power-Loss Testing** - Corruption resilience validation
-3. **Documentation** - Examples, guides, tutorials
-4. **Platform Testing** - ESP32, STM32, RISC-V
+1. **RwLock for Caches** - Better read concurrency
+2. **Directory Cache Integration** - Hook up existing cache
+3. **Multicore Examples** - Embassy, Tokio, async-std
+4. **Platform Testing** - ESP32, STM32, RP2350 (multicore)
 
 ### Low Priority
-1. **Write Coalescing** - Further flash wear reduction
-2. **Tiny Mode** - Ultra-low-memory support
-3. **exFAT Research** - Feasibility study
+1. **Heapless File Locking** - no_std without alloc
+2. **Write Coalescing** - Further flash wear reduction
+3. **Tiny Mode** - Ultra-low-memory support
+4. **exFAT Research** - Feasibility study
 
 ---
 
@@ -315,6 +405,15 @@ Interested in helping? Here are high-impact areas:
 - [ ] 100% test coverage on core paths
 - [ ] Power-loss resilience validated (10,000+ iterations)
 - [ ] 3+ real hardware platforms tested
+
+### Concurrent Access (v0.4 targets)
+- [x] `FileSystem: Send + Sync` when `IO: Send` ← **Completed!**
+- [x] File locking prevents concurrent write corruption ← **Completed!**
+- [ ] RwLock improves read concurrency by 2-4x
+- [ ] Zero deadlocks in stress tests (10,000+ iterations)
+- [ ] Works on Embassy multicore (RP2350, ESP32-S3)
+- [ ] Works with tokio multi-threaded runtime
+- [ ] Concurrent reads scale linearly with cores
 
 ### Adoption
 - [ ] >1000 crates.io downloads/month
