@@ -271,19 +271,23 @@ mod tests {
 
     impl<T: Read + Write + Seek> Read for TestBlockDevice<T> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            Ok(self.0.read(buf).await?)
+            self.0.read(buf).await
         }
     }
 
     impl<T: Read + Write + Seek> Write for TestBlockDevice<T> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            Ok(self.0.write(buf).await?)
+            self.0.write(buf).await
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().await
         }
     }
 
     impl<T: Read + Write + Seek> Seek for TestBlockDevice<T> {
         async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-            Ok(self.0.seek(pos).await?)
+            self.0.seek(pos).await
         }
     }
 

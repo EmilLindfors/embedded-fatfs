@@ -50,7 +50,7 @@ This repository contains various crates for interacting with FAT filesystems and
 
 ## Quick Start
 
-### Basic Usage
+### Basic Usage (Tokio)
 
 ```rust
 use embedded_fatfs::{FileSystem, FsOptions};
@@ -58,17 +58,17 @@ use embedded_io_async::Write;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open storage device
+    // Open storage device (direct access - FAT cache handles buffering internally)
     let img_file = tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("fat32.img")
         .await?;
 
-    let buf_stream = tokio::io::BufStream::new(img_file);
-
     // Mount filesystem with optimizations enabled
-    let fs = FileSystem::new(buf_stream, FsOptions::new()).await?;
+    // Note: Don't use tokio::io::BufStream - it slows down performance!
+    // The FAT cache and multi-cluster I/O optimizations handle buffering efficiently.
+    let fs = FileSystem::new(img_file, FsOptions::new()).await?;
 
     let root_dir = fs.root_dir();
 
@@ -87,6 +87,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs.flush().await?;
     Ok(())
+}
+```
+
+### Embedded Usage (Embassy)
+
+For embedded systems, use the `BufStream` adapter from `block-device-adapters`:
+
+```rust
+use embassy_executor::Spawner;
+use embedded_fatfs::{FileSystem, FsOptions};
+use embedded_io_async::{Read, Write};
+use block_device_adapters::BufStream;
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    // Initialize your SPI SD card driver
+    let sd_card = init_sd_card().await;
+
+    // Wrap in BufStream (512-byte buffer for SD cards)
+    let buf_stream = BufStream::<_, 512>::new(sd_card);
+
+    // Mount filesystem with optimizations
+    let fs = FileSystem::new(buf_stream, FsOptions::new()).await.unwrap();
+
+    // Create and write to a file
+    let mut file = fs.root_dir().create_file("test.log").await.unwrap();
+    file.write_all(b"Hello from embedded!").await.unwrap();
+    file.flush().await.unwrap();
+
+    // Read back
+    let mut buf = [0u8; 20];
+    file.rewind().await.unwrap();
+    file.read_exact(&mut buf).await.unwrap();
+
+    fs.unmount().await.unwrap();
 }
 ```
 

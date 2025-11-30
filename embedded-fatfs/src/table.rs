@@ -710,14 +710,14 @@ mod tests {
             let actual_cluster_numbers = {
                 let mut v = Vec::new();
                 while let Some(i) = iter.next().await {
-                    v.push(i.ok())
+                    v.push(i.ok());
                 }
 
                 v
             };
             let expected_cluster_numbers = [0xA_u32, 0x14_u32, 0x15_u32, 0x16_u32, 0x19_u32, 0x1A_u32]
                 .iter()
-                .cloned()
+                .copied()
                 .map(Some)
                 .collect::<Vec<_>>();
             assert_eq!(actual_cluster_numbers, expected_cluster_numbers);

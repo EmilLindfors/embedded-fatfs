@@ -6,7 +6,7 @@ use crate::fs::{FileSystem, ReadWriteSeek};
 use crate::io::{IoBase, Read, Seek, SeekFrom, Write};
 use crate::time::{Date, DateTime, TimeProvider};
 
-const MAX_FILE_SIZE: u32 = core::u32::MAX;
+const MAX_FILE_SIZE: u32 = u32::MAX;
 
 /// A FAT filesystem file object used for reading and writing data.
 ///
@@ -137,10 +137,62 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         }
     }
 
-    /// Get the extents of a file on disk.
-    ///
-    /// This returns an iterator over the byte ranges on-disk occupied by
-    /// this file.
+    /// Phase 3 Optimization: Find the closest checkpoint to the target cluster index
+    /// Returns (starting_cluster, clusters_already_traversed)
+    #[cfg(feature = "cluster-checkpoints")]
+    fn find_closest_checkpoint(&self, target_cluster_index: u32) -> (u32, u32) {
+        let first_cluster = self.context.first_cluster.unwrap();
+
+        // If no checkpoints recorded yet, start from beginning
+        if self.context.checkpoint_count == 0 {
+            return (first_cluster, 0);
+        }
+
+        // Find the checkpoint closest to but not exceeding target
+        let mut best_cluster = first_cluster;
+        let mut best_index = 0u32;
+
+        for i in 0..self.context.checkpoint_count as usize {
+            let (checkpoint_index, checkpoint_cluster) = self.context.checkpoints[i];
+            // Use checkpoint if it's closer to target than our current best
+            if checkpoint_index <= target_cluster_index && checkpoint_index > best_index {
+                best_index = checkpoint_index;
+                best_cluster = checkpoint_cluster;
+            }
+        }
+
+        trace!(
+            "Checkpoint seek: target={}, using checkpoint at index={} (saved {} cluster reads)",
+            target_cluster_index,
+            best_index,
+            best_index
+        );
+
+        (best_cluster, best_index)
+    }
+
+    /// Phase 3 Optimization: Record a checkpoint at the current position
+    /// Checkpoints are stored at exponentially increasing intervals for logarithmic seek
+    #[cfg(feature = "cluster-checkpoints")]
+    fn record_checkpoint(&mut self, cluster_index: u32, cluster: u32) {
+        // Record checkpoints at intervals: 8, 16, 32, 64, 128, 256, 512, 1024 clusters
+        // This gives O(log n) seek performance
+        let checkpoint_interval = 1u32 << (self.context.checkpoint_count.min(7) as u32 + 3);
+
+        if cluster_index > 0 && cluster_index % checkpoint_interval == 0 {
+            let idx = self.context.checkpoint_count as usize;
+            if idx < 8 {
+                self.context.checkpoints[idx] = (cluster_index, cluster);
+                self.context.checkpoint_count += 1;
+                trace!("Recorded checkpoint: index={}, cluster={}", cluster_index, cluster);
+            }
+        }
+    }
+
+    // /// Get the extents of a file on disk.
+    // ///
+    // /// This returns an iterator over the byte ranges on-disk occupied by
+    // /// this file.
     // pub fn extents(&mut self) -> impl Iterator<Item = Result<Extent, Error<IO::Error>>> + 'a {
     // let fs = self.fs;
     // let cluster_size = fs.cluster_size();
@@ -264,10 +316,13 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         self.context.first_cluster
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
         self.flush_dir_entry().await?;
-        let mut disk = self.fs.disk.borrow_mut();
-        disk.flush().await?;
+        {
+            let mut disk = self.fs.disk.lock().await;
+            disk.flush().await?;
+        }
         Ok(())
     }
 }
@@ -288,7 +343,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
     ///
     /// A [`FileContext`] is returned, which can be used in conjunction with the
     /// `to_file_with_context` API.
-    pub async fn close(self) -> Result<FileContext, Error<IO::Error>> {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn close(self) -> Result<FileContext, Error<IO::Error>> {
         Ok(FileContext {
             first_cluster: self.context.first_cluster,
             current_cluster: self.context.current_cluster,
@@ -336,6 +392,7 @@ where
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
+    #[allow(clippy::too_many_lines)]
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         trace!("File::read");
         let cluster_size = self.fs.cluster_size();
@@ -355,9 +412,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         } else {
             self.context.current_cluster
         };
-        let current_cluster = match current_cluster_opt {
-            Some(n) => n,
-            None => return Ok(0),
+        let Some(current_cluster) = current_cluster_opt else {
+            return Ok(0);
         };
         let offset_in_cluster = self.context.offset % cluster_size;
         let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(buf.len());
@@ -404,10 +460,16 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
 
                         if cluster_delta > 0 {
                             let mut cluster = current_cluster;
-                            for _ in 0..cluster_delta {
+                            for _i in 0..cluster_delta {
                                 let mut iter = self.fs.cluster_iter(cluster);
                                 if let Some(Ok(next)) = iter.next().await {
                                     cluster = next;
+                                    // Record checkpoint during sequential traversal
+                                    #[cfg(feature = "cluster-checkpoints")]
+                                    {
+                                        let cluster_idx = old_cluster_index + _i + 1;
+                                        self.record_checkpoint(cluster_idx, cluster);
+                                    }
                                 } else {
                                     break;
                                 }
@@ -442,8 +504,9 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         }
         trace!("read {} bytes in cluster {}", read_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+        #[allow(clippy::await_holding_refcell_ref)]
         let read_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.lock().await;
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.read(&mut buf[..read_size]).await?
         };
@@ -452,6 +515,13 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         }
         self.context.offset += read_bytes as u32;
         self.context.current_cluster = Some(current_cluster);
+
+        // Record checkpoint for sequential reads
+        #[cfg(feature = "cluster-checkpoints")]
+        if self.context.offset > 0 {
+            let cluster_idx = (self.context.offset / cluster_size).saturating_sub(1);
+            self.record_checkpoint(cluster_idx, current_cluster);
+        }
 
         if let Some(ref mut e) = self.context.entry {
             if self.fs.options.update_accessed_date {
@@ -464,6 +534,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
+    #[allow(clippy::too_many_lines)]
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         trace!("File::write");
         let cluster_size = self.fs.cluster_size();
@@ -540,10 +611,16 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
 
                         if cluster_delta > 0 {
                             let mut cluster = current_cluster;
-                            for _ in 0..cluster_delta {
+                            for _i in 0..cluster_delta {
                                 let mut iter = self.fs.cluster_iter(cluster);
                                 if let Some(Ok(next)) = iter.next().await {
                                     cluster = next;
+                                    // Record checkpoint during sequential write traversal
+                                    #[cfg(feature = "cluster-checkpoints")]
+                                    {
+                                        let cluster_idx = old_cluster_index + _i + 1;
+                                        self.record_checkpoint(cluster_idx, cluster);
+                                    }
                                 } else {
                                     break;
                                 }
@@ -609,8 +686,9 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         };
         trace!("write {} bytes in cluster {}", write_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+        #[allow(clippy::await_holding_refcell_ref)]
         let written_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.lock().await;
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.write(&buf[..write_size]).await?
         };
@@ -620,6 +698,14 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         // some bytes were writter - update position and optionally size
         self.context.offset += written_bytes as u32;
         self.context.current_cluster = Some(current_cluster);
+
+        // Record checkpoint for sequential writes
+        #[cfg(feature = "cluster-checkpoints")]
+        if self.context.offset > 0 {
+            let cluster_idx = (self.context.offset / cluster_size).saturating_sub(1);
+            self.record_checkpoint(cluster_idx, current_cluster);
+        }
+
         self.update_dir_entry_after_write();
         Ok(written_bytes)
     }
@@ -642,9 +728,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
                 .and_then(|s| i64::from(s).checked_add(o))
                 .and_then(|n| u32::try_from(n).ok()),
         };
-        let mut new_offset = if let Some(new_offset) = new_offset_opt {
-            new_offset
-        } else {
+        let Some(mut new_offset) = new_offset_opt else {
             error!("Invalid seek offset");
             return Err(Error::InvalidInput);
         };
@@ -676,9 +760,16 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
             // Note: new_offset_in_clusters cannot be 0 here because new_offset is not 0
             debug_assert!(new_offset_in_clusters > 0);
             let clusters_to_skip = new_offset_in_clusters - 1;
-            let mut cluster = first_cluster;
-            let mut iter = self.fs.cluster_iter(first_cluster);
-            for i in 0..clusters_to_skip {
+
+            // Phase 3 Optimization: Use cluster chain checkpoints for O(log n) seeking
+            #[cfg(feature = "cluster-checkpoints")]
+            let (mut cluster, start_index) = self.find_closest_checkpoint(clusters_to_skip);
+
+            #[cfg(not(feature = "cluster-checkpoints"))]
+            let (mut cluster, start_index) = (first_cluster, 0);
+
+            let mut iter = self.fs.cluster_iter(cluster);
+            for i in start_index..clusters_to_skip {
                 cluster = if let Some(r) = iter.next().await {
                     r?
                 } else {

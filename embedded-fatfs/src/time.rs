@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "year")]
     fn date_new_panic_year_1979() {
         let _ = Date::new(1979, 12, 31);
     }
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "year")]
     fn date_new_panic_year_2108() {
         let _ = Date::new(2108, 1, 1);
     }

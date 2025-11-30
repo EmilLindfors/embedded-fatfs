@@ -21,12 +21,66 @@ A FAT filesystem library implemented in Rust. Built on the shoulders of the amaz
 * LFN (Long File Names) extension is supported
 * `no_std` environment support
 
+## Quick Start
+
+### Tokio Example
+
+```rust
+use embedded_fatfs::{FileSystem, FsOptions};
+use embedded_io_async::Write;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let img_file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("fat32.img")
+        .await?;
+
+    // Don't use tokio::io::BufStream - it slows down performance!
+    // The FAT cache handles buffering internally.
+    let fs = FileSystem::new(img_file, FsOptions::new()).await?;
+
+    let mut file = fs.root_dir().create_file("hello.txt").await?;
+    file.write_all(b"Hello, embedded-fatfs!").await?;
+    file.flush().await?;
+
+    fs.flush().await?;
+    Ok(())
+}
+```
+
+### Embassy Example (Embedded)
+
+```rust
+use embassy_executor::Spawner;
+use embedded_fatfs::{FileSystem, FsOptions};
+use embedded_io_async::Write;
+use block_device_adapters::BufStream;
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let sd_card = init_sd_card().await;
+
+    // Use BufStream from block-device-adapters for embedded systems
+    let buf_stream = BufStream::<_, 512>::new(sd_card);
+    let fs = FileSystem::new(buf_stream, FsOptions::new()).await.unwrap();
+
+    let mut file = fs.root_dir().create_file("test.log").await.unwrap();
+    file.write_all(b"Hello from embedded!").await.unwrap();
+    file.flush().await.unwrap();
+
+    fs.unmount().await.unwrap();
+}
+```
+
 ## Porting from rust-fatfs to embedded-fatfs
 
 There a are a few key differences between the crates:
 
 - embedded-fatfs is async, therefore your storage device must implement the [embedded-io-async](https://github.com/rust-embedded/embedded-hal/tree/master/embedded-io-async) traits.
 - You must call `flush` on `File`s before they are dropped. See the CHANGELOG for details.
+- **Performance tip:** Don't use `tokio::io::BufStream` - the built-in FAT cache and multi-cluster I/O optimizations handle buffering more efficiently.
 
 `no_std` usage
 ------------

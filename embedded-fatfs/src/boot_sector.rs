@@ -803,7 +803,6 @@ pub(crate) fn format_boot_sector<E: IoError>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::u32;
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -868,12 +867,12 @@ mod tests {
         root_dir_entries: u32,
     ) {
         let total_sectors = total_bytes / u64::from(bytes_per_sector);
-        debug_assert!(total_sectors <= u64::from(u32::MAX), "{:x}", total_sectors);
+        debug_assert!(u32::try_from(total_sectors).is_ok(), "{:x}", total_sectors);
         let total_sectors = total_sectors as u32;
 
         let sectors_per_cluster = (bytes_per_cluster / u32::from(bytes_per_sector)) as u8;
-        let root_dir_size = root_dir_entries * DIR_ENTRY_SIZE as u32;
-        let root_dir_sectors = (root_dir_size + u32::from(bytes_per_sector) - 1) / u32::from(bytes_per_sector);
+        let root_dir_size = root_dir_entries * DIR_ENTRY_SIZE;
+        let root_dir_sectors = root_dir_size.div_ceil(u32::from(bytes_per_sector));
         let sectors_per_fat = determine_sectors_per_fat(
             total_sectors,
             bytes_per_sector,
@@ -960,9 +959,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::items_after_statements)]
     fn test_format_boot_sector() {
-        init();
-
         #[derive(Debug)]
         struct Dummy;
 
@@ -983,6 +981,8 @@ mod tests {
                 embedded_io_async::ErrorKind::TimedOut
             }
         }
+
+        init();
 
         let bytes_per_sector = 512_u16;
         // test all partition sizes from 1MB to 2TB (u32::MAX sectors is 2TB - 1 for 512 byte sectors)

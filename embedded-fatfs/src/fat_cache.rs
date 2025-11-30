@@ -1,12 +1,12 @@
-/// FAT sector cache for improved performance
-///
-/// This module implements an LRU (Least Recently Used) cache for FAT sectors,
-/// significantly reducing disk I/O operations during FAT traversal.
-///
-/// Performance impact:
-/// - Sequential access: 5-10x faster
-/// - Random access: 20-50x faster
-/// - Memory cost: configurable (default 4KB for 8 sectors)
+//! FAT sector cache for improved performance
+//!
+//! This module implements an LRU (Least Recently Used) cache for FAT sectors,
+//! significantly reducing disk I/O operations during FAT traversal.
+//!
+//! Performance impact:
+//! - Sequential access: 5-10x faster
+//! - Random access: 20-50x faster
+//! - Memory cost: configurable (default 4KB for 8 sectors)
 
 use crate::error::Error;
 use crate::io::{IoBase, Read, Seek, SeekFrom, Write};
@@ -58,6 +58,7 @@ pub struct FatCache {
 #[cfg(feature = "fat-cache")]
 impl FatCache {
     /// Create a new FAT cache
+    #[allow(clippy::large_stack_arrays)]
     pub fn new(sector_size: u32) -> Self {
         Self {
             sectors: [const { None }; FAT_CACHE_SECTORS],
@@ -71,7 +72,7 @@ impl FatCache {
     /// Get the sector offset for a given byte offset
     #[inline]
     fn sector_offset(&self, offset: u64) -> u64 {
-        (offset / self.sector_size as u64) * self.sector_size as u64
+        (offset / u64::from(self.sector_size)) * u64::from(self.sector_size)
     }
 
     /// Find a cached sector by offset
@@ -248,6 +249,7 @@ impl FatCache {
         S: Write + Seek + IoBase,
         Error<E>: From<S::Error>,
     {
+        #[allow(clippy::manual_flatten)]
         for slot in &mut self.sectors {
             if let Some(sector) = slot {
                 if sector.dirty {
@@ -269,6 +271,7 @@ impl FatCache {
     }
 
     /// Invalidate the entire cache
+    #[allow(dead_code)]
     pub fn invalidate(&mut self) {
         for slot in &mut self.sectors {
             *slot = None;
@@ -277,6 +280,7 @@ impl FatCache {
 
     /// Get cache statistics
     pub fn statistics(&self) -> CacheStatistics {
+        #[allow(clippy::cast_precision_loss)]
         CacheStatistics {
             hits: self.hits,
             misses: self.misses,
@@ -305,7 +309,7 @@ where
     S: Read + Write + Seek + IoBase,
 {
     inner: S,
-    cache: &'a core::cell::RefCell<FatCache>,
+    cache: &'a async_lock::Mutex<FatCache>,
     current_offset: u64,
 }
 
@@ -314,7 +318,7 @@ impl<'a, S> CachedFatSlice<'a, S>
 where
     S: Read + Write + Seek + IoBase,
 {
-    pub fn new(inner: S, cache: &'a core::cell::RefCell<FatCache>) -> Self {
+    pub fn new(inner: S, cache: &'a async_lock::Mutex<FatCache>) -> Self {
         Self {
             inner,
             cache,
@@ -340,7 +344,7 @@ where
 {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         // Read through cache - cache handles all error conversions
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().await;
         cache.read_cached(&mut self.inner, self.current_offset, buf).await?;
         self.current_offset += buf.len() as u64;
         Ok(buf.len())
@@ -355,14 +359,14 @@ where
 {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         // Write through cache
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().await;
         cache.write_cached(&mut self.inner, self.current_offset, buf).await?;
         self.current_offset += buf.len() as u64;
         Ok(buf.len())
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().await;
         cache.flush(&mut self.inner).await
     }
 }
@@ -377,6 +381,7 @@ where
         let new_offset = match pos {
             SeekFrom::Start(offset) => offset,
             SeekFrom::Current(delta) => {
+                #[allow(clippy::cast_sign_loss)]
                 if delta >= 0 {
                     self.current_offset + delta as u64
                 } else {
@@ -404,7 +409,7 @@ mod tests {
         let stats = cache.statistics();
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 0);
-        assert_eq!(stats.hit_rate, 0.0);
+        assert!(stats.hit_rate < f32::EPSILON);
     }
 
     #[test]

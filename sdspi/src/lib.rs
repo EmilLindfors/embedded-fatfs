@@ -111,7 +111,7 @@ where
 
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
     pub async fn init(&mut self) -> Result<(), Error> {
-        let r = async {
+        async {
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
                     let r = self.cmd(idle()).await?;
@@ -207,9 +207,7 @@ where
 
             Ok(())
         }
-        .await;
-
-        r
+        .await
     }
 
     pub async fn read<const SIZE: usize>(

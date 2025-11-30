@@ -1,13 +1,13 @@
-/// Multi-cluster I/O optimization module
-///
-/// This module implements batched read/write operations across multiple
-/// contiguous clusters, significantly improving performance and reducing
-/// flash wear.
-///
-/// Performance impact:
-/// - Sequential I/O: 2-5x throughput improvement
-/// - Flash wear: 16x reduction (per ChaN FatFs research)
-/// - Enables hardware DMA for large transfers
+//! Multi-cluster I/O optimization module
+//!
+//! This module implements batched read/write operations across multiple
+//! contiguous clusters, significantly improving performance and reducing
+//! flash wear.
+//!
+//! Performance impact:
+//! - Sequential I/O: 2-5x throughput improvement
+//! - Flash wear: 16x reduction (per `ChaN` `FatFs` research)
+//! - Enables hardware DMA for large transfers
 
 use core::cmp;
 
@@ -56,10 +56,11 @@ where
 /// Calculate the number of clusters needed for a given byte count
 #[inline]
 pub(crate) fn clusters_needed(bytes: usize, cluster_size: u32) -> u32 {
-    ((bytes as u64 + cluster_size as u64 - 1) / cluster_size as u64) as u32
+    ((bytes as u64).div_ceil(u64::from(cluster_size))) as u32
 }
 
 /// Read from contiguous clusters in a single operation
+#[allow(clippy::await_holding_refcell_ref)]
 pub(crate) async fn read_contiguous<IO: ReadWriteSeek, TP, OCC>(
     fs: &FileSystem<IO, TP, OCC>,
     start_cluster: u32,
@@ -91,14 +92,17 @@ where
 
     // Perform the read
     let offset_in_fs = fs.offset_from_cluster(start_cluster) + u64::from(offset_in_cluster);
-    let mut disk = fs.disk.borrow_mut();
-    disk.seek(SeekFrom::Start(offset_in_fs)).await?;
-    let bytes_read = disk.read(&mut buf[..read_size]).await?;
+    let bytes_read = {
+        let mut disk = fs.disk.lock().await;
+        disk.seek(SeekFrom::Start(offset_in_fs)).await?;
+        disk.read(&mut buf[..read_size]).await?
+    };
 
     Ok(bytes_read)
 }
 
 /// Write to contiguous clusters in a single operation
+#[allow(clippy::await_holding_refcell_ref)]
 pub(crate) async fn write_contiguous<IO: ReadWriteSeek, TP, OCC>(
     fs: &FileSystem<IO, TP, OCC>,
     start_cluster: u32,
@@ -130,17 +134,20 @@ where
 
     // Perform the write
     let offset_in_fs = fs.offset_from_cluster(start_cluster) + u64::from(offset_in_cluster);
-    let mut disk = fs.disk.borrow_mut();
-    disk.seek(SeekFrom::Start(offset_in_fs)).await?;
+    let written = {
+        let mut disk = fs.disk.lock().await;
+        disk.seek(SeekFrom::Start(offset_in_fs)).await?;
 
-    let mut written = 0;
-    while written < write_size {
-        let n = disk.write(&buf[written..write_size]).await?;
-        if n == 0 {
-            return Err(Error::WriteZero);
+        let mut written = 0;
+        while written < write_size {
+            let n = disk.write(&buf[written..write_size]).await?;
+            if n == 0 {
+                return Err(Error::WriteZero);
+            }
+            written += n;
         }
-        written += n;
-    }
+        written
+    };
 
     Ok(written)
 }
@@ -149,6 +156,7 @@ where
 ///
 /// This is called after file allocation to mark files that can use
 /// the fast path (skipping FAT traversal entirely for sequential access)
+#[allow(dead_code)]
 pub(crate) async fn detect_file_contiguity<IO: ReadWriteSeek, TP, OCC>(
     fs: &FileSystem<IO, TP, OCC>,
     first_cluster: u32,
@@ -162,7 +170,7 @@ where
     }
 
     let cluster_size = fs.cluster_size();
-    let total_clusters = (file_size + cluster_size - 1) / cluster_size;
+    let total_clusters = file_size.div_ceil(cluster_size);
 
     // Check if all clusters are sequential
     let contiguous_count = check_contiguous_run(fs, first_cluster, total_clusters).await?;

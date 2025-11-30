@@ -46,8 +46,8 @@ async fn benchmark_sequential_read() {
         .await
         .unwrap();
 
-    let buf_stream = tokio::io::BufStream::new(img_file);
-    let fs = embedded_fatfs::FileSystem::new(buf_stream, embedded_fatfs::FsOptions::new())
+    // Don't use BufStream - the FAT cache handles buffering more efficiently
+    let fs = embedded_fatfs::FileSystem::new(img_file, embedded_fatfs::FsOptions::new())
         .await
         .unwrap();
 
@@ -101,8 +101,8 @@ async fn benchmark_sequential_write() {
         .await
         .unwrap();
 
-    let buf_stream = tokio::io::BufStream::new(img_file);
-    let fs = embedded_fatfs::FileSystem::new(buf_stream, embedded_fatfs::FsOptions::new())
+    // Don't use BufStream - the FAT cache handles buffering more efficiently
+    let fs = embedded_fatfs::FileSystem::new(img_file, embedded_fatfs::FsOptions::new())
         .await
         .unwrap();
 

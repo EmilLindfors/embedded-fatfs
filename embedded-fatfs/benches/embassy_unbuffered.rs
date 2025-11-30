@@ -230,7 +230,7 @@ async fn benchmark_sequential_read() {
 
     // Get cache statistics if available
     #[cfg(feature = "fat-cache")]
-    let cache_stats = fs.fat_cache_statistics();
+    let cache_stats = fs.fat_cache_statistics().await;
 
     print_sequential_results("READ", total_read, elapsed, stats);
 
@@ -277,7 +277,7 @@ async fn benchmark_sequential_write() {
 
     // Get cache statistics if available
     #[cfg(feature = "fat-cache")]
-    let cache_stats = fs.fat_cache_statistics();
+    let cache_stats = fs.fat_cache_statistics().await;
 
     print_sequential_results("WRITE", total, elapsed, stats);
 
@@ -336,7 +336,7 @@ async fn benchmark_random_access() {
 
     // Get cache statistics if available
     #[cfg(feature = "fat-cache")]
-    let cache_stats = fs.fat_cache_statistics();
+    let cache_stats = fs.fat_cache_statistics().await;
 
     println!("  Iterations: {}", iterations);
     println!("  Total time: {:.3}s", elapsed.as_secs_f64());

@@ -207,16 +207,19 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
     }
 
     /// Check to see if a file or directory with the given name exists
+    #[allow(clippy::missing_errors_doc)]
     pub async fn exists(&self, path: &str) -> Result<bool, Error<IO::Error>> {
         self.exists_internal(path, None).await
     }
 
     /// Check to see if a file with the given name exists
+    #[allow(clippy::missing_errors_doc)]
     pub async fn file_exists(&self, path: &str) -> Result<bool, Error<IO::Error>> {
         self.exists_internal(path, Some(false)).await
     }
 
     /// Check to see if a directory with the given name exists
+    #[allow(clippy::missing_errors_doc)]
     pub async fn dir_exists(&self, path: &str) -> Result<bool, Error<IO::Error>> {
         self.exists_internal(path, Some(true)).await
     }
@@ -432,6 +435,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         }
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub async fn is_empty(&self) -> Result<bool, Error<IO::Error>> {
         trace!("Dir::is_empty");
         // check if directory contains no files

@@ -77,7 +77,7 @@ async fn test_read_seek_context_resume(fs: FileSystem) {
     let root_dir = fs.root_dir();
     let mut short_file = root_dir.open_file("short.txt").await.unwrap();
     let pos = short_file.seek(SeekFrom::End(-5)).await.unwrap();
-    let context = short_file.close().await.unwrap();
+    let context = short_file.close().unwrap();
 
     let short_file = root_dir.open_meta("short.txt").await.unwrap();
     let mut short_file = short_file.to_file_with_context(context.clone());

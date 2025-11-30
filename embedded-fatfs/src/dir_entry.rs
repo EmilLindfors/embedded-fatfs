@@ -537,10 +537,14 @@ impl DirEntryEditor {
         Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn write<IO: ReadWriteSeek, TP, OCC>(&self, fs: &FileSystem<IO, TP, OCC>) -> Result<(), IO::Error> {
-        let mut disk = fs.disk.borrow_mut();
-        disk.seek(io::SeekFrom::Start(self.pos)).await?;
-        self.data.serialize(&mut *disk).await
+        {
+            let mut disk = fs.disk.lock().await;
+            disk.seek(io::SeekFrom::Start(self.pos)).await?;
+            self.data.serialize(&mut *disk).await?;
+        }
+        Ok(())
     }
 }
 
@@ -669,7 +673,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
     /// # Panics
     ///
     /// Will panic if this is not a file.
-    #[must_use]
+    #[allow(clippy::missing_errors_doc)]
     pub fn try_to_file_with_context(&self, context: FileContext) -> Result<File<'a, IO, TP, OCC>, Error<IO::Error>> {
         assert!(!self.is_dir(), "Not a file entry");
         if context.entry != Some(self.editor()) {
@@ -800,7 +804,7 @@ mod tests {
     fn short_name_without_ext() {
         let oem_cp_conv = LossyOemCpConverter::new();
         assert_eq!(ShortName::new(b"FOO        ").to_string(&oem_cp_conv), "FOO");
-        assert_eq!(ShortName::new(&b"LOOK AT    ").to_string(&oem_cp_conv), "LOOK AT");
+        assert_eq!(ShortName::new(b"LOOK AT    ").to_string(&oem_cp_conv), "LOOK AT");
     }
 
     #[test]

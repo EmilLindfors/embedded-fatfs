@@ -73,8 +73,8 @@ async fn bench_allocation_at_fill_level(fill_pct: f32, num_allocations: u32) {
         .await
         .unwrap();
 
-    let buf_stream = tokio::io::BufStream::new(img_file);
-    let fs = FileSystem::new(buf_stream, FsOptions::new()).await.unwrap();
+    // Don't use BufStream - the FAT cache handles buffering more efficiently
+    let fs = FileSystem::new(img_file, FsOptions::new()).await.unwrap();
 
     // Fill to target percentage
     if fill_pct > 0.0 {
@@ -87,7 +87,7 @@ async fn bench_allocation_at_fill_level(fill_pct: f32, num_allocations: u32) {
 
     #[cfg(feature = "cluster-bitmap")]
     {
-        let bitmap_stats = fs.cluster_bitmap_statistics();
+        let bitmap_stats = fs.cluster_bitmap_statistics().await;
         println!("Bitmap: {} free, {} allocated, {:.1}% utilization",
             bitmap_stats.free_clusters,
             bitmap_stats.allocated_clusters,
@@ -122,7 +122,7 @@ async fn bench_allocation_at_fill_level(fill_pct: f32, num_allocations: u32) {
 
     #[cfg(feature = "cluster-bitmap")]
     {
-        let bitmap_stats = fs.cluster_bitmap_statistics();
+        let bitmap_stats = fs.cluster_bitmap_statistics().await;
         println!("  Bitmap fast allocations: {}", bitmap_stats.fast_allocations);
         println!("  Bitmap slow allocations: {}", bitmap_stats.slow_allocations);
     }
@@ -177,8 +177,8 @@ async fn bench_worst_case_fragmentation() {
         .await
         .unwrap();
 
-    let buf_stream = tokio::io::BufStream::new(img_file);
-    let fs = FileSystem::new(buf_stream, FsOptions::new()).await.unwrap();
+    // Don't use BufStream - the FAT cache handles buffering more efficiently
+    let fs = FileSystem::new(img_file, FsOptions::new()).await.unwrap();
 
     // Create fragmentation: allocate and delete every other file
     println!("\nCreating fragmentation pattern...");
@@ -224,7 +224,7 @@ async fn bench_worst_case_fragmentation() {
 
     #[cfg(feature = "cluster-bitmap")]
     {
-        let bitmap_stats = fs.cluster_bitmap_statistics();
+        let bitmap_stats = fs.cluster_bitmap_statistics().await;
         println!("  ✓ Bitmap handled fragmentation efficiently");
         println!("  Fast allocations: {}", bitmap_stats.fast_allocations);
     }

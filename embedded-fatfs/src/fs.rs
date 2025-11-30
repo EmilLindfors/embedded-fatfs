@@ -1,10 +1,10 @@
 use core::borrow::BorrowMut;
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 use core::char;
+use async_lock::Mutex;
 use core::cmp;
 use core::fmt::Debug;
 use core::marker::PhantomData;
-use core::u32;
 
 #[cfg(all(not(feature = "std"), feature = "alloc", feature = "lfn"))]
 use alloc::string::String;
@@ -325,21 +325,21 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC>
 where
     IO::Error: 'static,
 {
-    pub(crate) disk: RefCell<IO>,
+    pub(crate) disk: Mutex<IO>,
     pub(crate) options: FsOptions<TP, OCC>,
     fat_type: FatType,
     bpb: BiosParameterBlock,
     first_data_sector: u32,
     root_dir_sectors: u32,
     total_clusters: u32,
-    fs_info: RefCell<FsInfoSector>,
+    fs_info: Mutex<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
     #[cfg(feature = "fat-cache")]
-    pub(crate) fat_cache: RefCell<crate::fat_cache::FatCache>,
+    pub(crate) fat_cache: Mutex<crate::fat_cache::FatCache>,
     #[cfg(feature = "dir-cache")]
-    pub(crate) dir_cache: RefCell<crate::dir_cache::DirCache>,
+    pub(crate) dir_cache: Mutex<crate::dir_cache::DirCache>,
     #[cfg(feature = "cluster-bitmap")]
-    pub(crate) cluster_bitmap: RefCell<crate::cluster_bitmap::ClusterBitmap>,
+    pub(crate) cluster_bitmap: Mutex<crate::cluster_bitmap::ClusterBitmap>,
 }
 
 /// The underlying storage device
@@ -421,32 +421,32 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         // return FileSystem struct
         let status_flags = bpb.status_flags();
         #[cfg(feature = "fat-cache")]
-        let sector_size = bpb.bytes_per_sector as u32;
+        let sector_size = u32::from(bpb.bytes_per_sector);
         trace!("FileSystem::new end");
 
         let fs = Self {
-            disk: RefCell::new(disk),
+            disk: Mutex::new(disk),
             options,
             fat_type,
             bpb,
             first_data_sector,
             root_dir_sectors,
             total_clusters,
-            fs_info: RefCell::new(fs_info),
+            fs_info: Mutex::new(fs_info),
             current_status_flags: Cell::new(status_flags),
             #[cfg(feature = "fat-cache")]
-            fat_cache: RefCell::new(crate::fat_cache::FatCache::new(sector_size)),
+            fat_cache: Mutex::new(crate::fat_cache::FatCache::new(sector_size)),
             #[cfg(feature = "dir-cache")]
-            dir_cache: RefCell::new(crate::dir_cache::DirCache::new()),
+            dir_cache: Mutex::new(crate::dir_cache::DirCache::new()),
             #[cfg(feature = "cluster-bitmap")]
-            cluster_bitmap: RefCell::new(crate::cluster_bitmap::ClusterBitmap::new(total_clusters)),
+            cluster_bitmap: Mutex::new(crate::cluster_bitmap::ClusterBitmap::new(total_clusters)),
         };
 
         // Build cluster bitmap from FAT (one-time cost at mount for 10-100x allocation speedup)
         #[cfg(feature = "cluster-bitmap")]
         {
             trace!("Building cluster bitmap from FAT...");
-            let mut bitmap = fs.cluster_bitmap.borrow_mut();
+            let mut bitmap = fs.cluster_bitmap.lock().await;
             let mut fat = fs.fat_slice();
             bitmap.build_from_fat(&mut fat, fat_type, total_clusters).await?;
             trace!("Cluster bitmap built: {} free clusters", bitmap.free_count());
@@ -530,7 +530,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     pub(crate) async fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
         let mut iter = self.cluster_iter(cluster);
         let num_free = iter.truncate().await?;
-        let mut fs_info = self.fs_info.borrow_mut();
+        let mut fs_info = self.fs_info.lock().await;
         fs_info.map_free_clusters(|n| n + num_free);
         Ok(())
     }
@@ -562,25 +562,26 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         // Update bitmap
         #[cfg(feature = "cluster-bitmap")]
         {
-            let mut bitmap = self.cluster_bitmap.borrow_mut();
+            let mut bitmap = self.cluster_bitmap.lock().await;
             for c in clusters_to_free {
                 bitmap.set_free(c);
             }
         }
 
-        let mut fs_info = self.fs_info.borrow_mut();
+        let mut fs_info = self.fs_info.lock().await;
         fs_info.map_free_clusters(|n| n + num_free);
         Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     pub(crate) async fn alloc_cluster(&self, prev_cluster: Option<u32>, zero: bool) -> Result<u32, Error<IO::Error>> {
         trace!("alloc_cluster");
 
         // Use cluster bitmap for fast allocation if enabled
         #[cfg(feature = "cluster-bitmap")]
         let hint = {
-            let mut bitmap = self.cluster_bitmap.borrow_mut();
-            let hint_from_fsinfo = self.fs_info.borrow().next_free_cluster
+            let mut bitmap = self.cluster_bitmap.lock().await;
+            let hint_from_fsinfo = self.fs_info.lock().await.next_free_cluster
                 .unwrap_or(RESERVED_FAT_ENTRIES);
 
             // Find free cluster using bitmap (O(1) average instead of O(n))
@@ -594,7 +595,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         };
 
         #[cfg(not(feature = "cluster-bitmap"))]
-        let hint = self.fs_info.borrow().next_free_cluster;
+        let hint = self.fs_info.lock().await.next_free_cluster;
 
         let cluster = {
             let mut fat = self.fat_slice();
@@ -604,16 +605,16 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         // Update bitmap to mark cluster as allocated
         #[cfg(feature = "cluster-bitmap")]
         {
-            let mut bitmap = self.cluster_bitmap.borrow_mut();
+            let mut bitmap = self.cluster_bitmap.lock().await;
             bitmap.set_allocated(cluster);
         }
 
         if zero {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.lock().await;
             disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster))).await?;
             write_zeros(&mut *disk, u64::from(self.cluster_size())).await?;
         }
-        let mut fs_info = self.fs_info.borrow_mut();
+        let mut fs_info = self.fs_info.lock().await;
         fs_info.set_next_free_cluster(cluster + 1);
         fs_info.map_free_clusters(|n| n - 1);
         Ok(cluster)
@@ -642,7 +643,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub async fn stats(&self) -> Result<FileSystemStats, Error<IO::Error>> {
-        let free_clusters_option = self.fs_info.borrow().free_cluster_count;
+        let free_clusters_option = self.fs_info.lock().await.free_cluster_count;
         let free_clusters = if let Some(n) = free_clusters_option {
             n
         } else {
@@ -659,7 +660,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     async fn recalc_free_clusters(&self) -> Result<u32, Error<IO::Error>> {
         let mut fat = self.fat_slice();
         let free_cluster_count = count_free_clusters(&mut fat, self.fat_type, self.total_clusters).await?;
-        self.fs_info.borrow_mut().set_free_cluster_count(free_cluster_count);
+        self.fs_info.lock().await.set_free_cluster_count(free_cluster_count);
         Ok(free_cluster_count)
     }
 
@@ -679,8 +680,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// Only available when `fat-cache` feature is enabled.
     /// Use this to verify cache effectiveness and tune cache size.
     #[cfg(feature = "fat-cache")]
-    pub fn fat_cache_statistics(&self) -> crate::fat_cache::CacheStatistics {
-        self.fat_cache.borrow().statistics()
+    pub async fn fat_cache_statistics(&self) -> crate::fat_cache::CacheStatistics {
+        self.fat_cache.lock().await.statistics()
     }
 
     /// Get cluster bitmap statistics
@@ -691,20 +692,21 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// - Number of fast allocations performed
     /// - Bitmap memory usage
     #[cfg(feature = "cluster-bitmap")]
-    pub fn cluster_bitmap_statistics(&self) -> crate::cluster_bitmap::ClusterBitmapStatistics {
-        self.cluster_bitmap.borrow().statistics()
+    pub async fn cluster_bitmap_statistics(&self) -> crate::cluster_bitmap::ClusterBitmapStatistics {
+        self.cluster_bitmap.lock().await.statistics()
     }
 
     /// Flushes any in memory state to the filesystem
     ///
     /// Updates the FS Information Sector if needed and clears
     /// the dirty flag.
+    #[allow(clippy::missing_errors_doc)]
     pub async fn flush(&self) -> Result<(), Error<IO::Error>> {
         // Flush FAT cache if enabled
         #[cfg(feature = "fat-cache")]
         {
-            let mut cache = self.fat_cache.borrow_mut();
-            let mut disk = self.disk.borrow_mut();
+            let mut cache = self.fat_cache.lock().await;
+            let mut disk = self.disk.lock().await;
             cache.flush(&mut *disk).await?;
         }
 
@@ -714,9 +716,9 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 
     async fn flush_fs_info(&self) -> Result<(), Error<IO::Error>> {
-        let mut fs_info = self.fs_info.borrow_mut();
+        let mut fs_info = self.fs_info.lock().await;
         if self.fat_type == FatType::Fat32 && fs_info.dirty {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.lock().await;
             let fs_info_sector_offset = self.offset_from_sector(u32::from(self.bpb.fs_info_sector));
             disk.seek(SeekFrom::Start(fs_info_sector_offset)).await?;
             fs_info.serialize(&mut *disk).await?;
@@ -743,7 +745,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         } else {
             0x025
         };
-        let mut disk = self.disk.borrow_mut();
+        let mut disk = self.disk.lock().await;
         disk.seek(io::SeekFrom::Start(offset)).await?;
         disk.write_u8(encoded).await?;
         disk.flush().await?;
@@ -752,7 +754,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 
     /// Returns a root directory object allowing for futher penetration of a filesystem structure.
-    pub fn root_dir(&self) -> Dir<IO, TP, OCC> {
+    pub fn root_dir(&self) -> Dir<'_, IO, TP, OCC> {
         trace!("root_dir");
         let root_rdr = {
             match self.fat_type {
@@ -850,13 +852,13 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
 
 impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.fs.disk.borrow_mut().read(buf).await
+        self.fs.disk.lock().await.read(buf).await
     }
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let size = self.fs.disk.borrow_mut().write(buf).await?;
+        let size = self.fs.disk.lock().await.write(buf).await?;
         if size > 0 {
             self.fs.set_dirty_flag(true).await?;
         }
@@ -864,13 +866,13 @@ impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.fs.disk.borrow_mut().flush().await
+        self.fs.disk.lock().await.flush().await
     }
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Seek for FsIoAdapter<'_, IO, TP, OCC> {
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-        self.fs.disk.borrow_mut().seek(pos).await
+        self.fs.disk.lock().await.seek(pos).await
     }
 }
 

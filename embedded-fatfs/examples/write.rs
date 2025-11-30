@@ -2,7 +2,6 @@ use anyhow::Context;
 use embedded_fatfs::{FileSystem, FsOptions};
 use embedded_io_async::Write;
 use tokio::fs::OpenOptions;
-use tokio::io::BufStream;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,9 +12,9 @@ async fn main() -> anyhow::Result<()> {
         .open("tmp/fat.img")
         .await
         .context("Failed to open image!")?;
-    let buf_stream = BufStream::new(img_file);
+    // Note: Don't use tokio::io::BufStream - the FAT cache handles buffering more efficiently
     let options = FsOptions::new().update_accessed_date(true);
-    let fs = FileSystem::new(buf_stream, options).await?;
+    let fs = FileSystem::new(img_file, options).await?;
     {
         // create a dir
         fs.root_dir().create_dir("foo").await?;
