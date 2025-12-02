@@ -3,7 +3,7 @@
 use embedded_io_async::{ErrorType, Read, Seek, SeekFrom, Write};
 
 #[cfg(windows)]
-use fatrs_adapters_alloc::LargePageStream;
+use fatrs_adapters::LargePageStream;
 #[cfg(windows)]
 use fatrs_block_platform::StreamBlockDevice;
 

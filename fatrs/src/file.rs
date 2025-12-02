@@ -355,7 +355,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     }
 
     #[allow(clippy::await_holding_refcell_ref)]
-    async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
+    pub async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
         self.flush_dir_entry().await?;
         {
             let mut disk = self.fs.disk.acquire().await;
@@ -366,7 +366,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
-    fn update_dir_entry_after_write(&mut self) {
+    async fn update_dir_entry_after_write(&mut self) -> Result<(), Error<IO::Error>> {
         let offset = self.context.offset;
         if let Some(ref mut e) = self.context.entry {
             let now = self.fs.options.time_provider.get_current_date_time();
@@ -374,7 +374,11 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             if e.inner().size().is_some_and(|s| offset > s) {
                 e.set_size(offset);
             }
+            // CRITICAL FIX: Flush directory entry immediately after updating size
+            // This prevents data corruption when multiple files are written
+            self.flush_dir_entry().await?;
         }
+        Ok(())
     }
 
     /// Manually close the file
@@ -460,12 +464,18 @@ impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
     fn drop(&mut self) {
         if let Some(e) = &self.context.entry {
             if e.dirty() {
-                warn!("Dropping dirty file before flushing");
+                error!("CRITICAL: Dropping dirty file before flushing - data loss imminent!");
+                error!("File size or metadata changes will be lost. Always call flush() before dropping File.");
                 #[cfg(feature = "dirty-file-panic")]
                 {
-                    panic!("Dropping unflushed file");
+                    panic!("Dropping unflushed file - this causes data corruption");
                 }
             }
+        }
+
+        #[cfg(feature = "file-locking")]
+        if let (Some(lock_info), Some(first_cluster)) = (self.lock_info, self.context.first_cluster) {
+            warn!("File dropped while locked - lock will not be released properly");
         }
     }
 }
@@ -735,7 +745,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
                                 self.context.current_cluster = Some(cluster);
                             }
 
-                            self.update_dir_entry_after_write();
+                            self.update_dir_entry_after_write().await?;
                             trace!("multi-cluster write: {} bytes", written_bytes);
                             return Ok(written_bytes);
                         }
@@ -814,7 +824,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
             self.record_checkpoint(cluster_idx, current_cluster);
         }
 
-        self.update_dir_entry_after_write();
+        self.update_dir_entry_after_write().await?;
         Ok(written_bytes)
     }
 

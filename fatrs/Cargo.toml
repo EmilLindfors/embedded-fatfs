@@ -88,8 +88,7 @@ env_logger = "0.11"
 tokio = { version = "1", default-features = false, features = ["fs", "rt-multi-thread", "macros", "io-util", "sync"] }
 futures = "0.3"
 anyhow = "1"
-fatrs-adapters-core = { path = "../fatrs-adapters-core", features = ["std"] }
-fatrs-adapters-alloc = { path = "../fatrs-adapters-alloc" }
+fatrs-adapters = { path = "../fatrs-adapters", features = ["std", "alloc"] }
 fatrs-block-device = { path = "../fatrs-block-device" }
 aligned = "0.4.2"
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }

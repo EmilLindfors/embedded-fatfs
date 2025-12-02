@@ -4,10 +4,10 @@ resolver = "2"
 members = [
     "fatrs",
     "fatrs-block-device",
-    "fatrs-adapters-core",
-    "fatrs-adapters-alloc",
+    "fatrs-adapters",
     "fatrs-cli",
-    "fatrs-block-platform", "fatrs-fuse",
+    "fatrs-block-platform",
+    "fatrs-fuse",
 ]
 # exclude embedded examples because cargo doesn't do well with multi-arch workspaces
 exclude = ["examples/esp32c6", "examples/rp2040"]

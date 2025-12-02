@@ -134,14 +134,15 @@ async fn open_image_file(
         #[cfg(windows)]
         {
             // Open Windows device
-            use fatrs_adapters_alloc::{LargePageStream, presets};
+            use fatrs_adapters::{LargePageStream, presets};
 
             let device = fatrs_cli::AsyncWindowsDevice::open(image_path, false)
                 .await
                 .with_context(|| format!("Failed to open device: {}", image_path))?;
 
             let block_dev = fatrs_block_platform::StreamBlockDevice(device);
-            let stream = LargePageStream::new(block_dev, presets::PAGE_4K);
+            let stream = LargePageStream::new(block_dev, presets::PAGE_4K)
+                .with_context(|| "Failed to create page stream")?;
 
             let io = UnifiedIO::Device(stream);
 
@@ -287,55 +288,152 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: FatApp) -
                 // Clear any popup message on keypress
                 app.message = None;
 
+                // Handle global shortcuts FIRST (before input mode check)
+                // These work in all modes
+
+                // Ctrl+X as escape alternative
+                if key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if app.view == View::EditMode {
+                        app.exit_edit_mode();
+                        continue;
+                    } else if app.view == View::FileContent || app.view == View::HexView || app.view == View::ImageView {
+                        app.clear_view_data();
+                        app.view = View::Browser;
+                        continue;
+                    } else if app.show_help_popup {
+                        app.close_help();
+                        continue;
+                    } else if app.show_browser_menu {
+                        app.close_browser_menu();
+                        continue;
+                    } else if app.view == View::FileActionMenu {
+                        app.close_file_menu();
+                        continue;
+                    }
+                }
+
+                // Ctrl+S to save in edit mode
+                if (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.view == View::EditMode
+                {
+                    if let Err(e) = app.save_edited_file() {
+                        app.message = Some(format!("Save failed: {:?}", e));
+                    }
+                    continue;
+                }
+
+                // F2 to save in edit mode
+                if key.code == KeyCode::F(2) && app.view == View::EditMode {
+                    if let Err(e) = app.save_edited_file() {
+                        app.message = Some(format!("Save failed: {:?}", e));
+                    }
+                    continue;
+                }
+
                 match app.input_mode {
-                    InputMode::Normal => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                            app.enter_selected()?
-                        }
-                        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                            app.go_parent()?
-                        }
-                        KeyCode::Char('v') => app.view_file()?,
-                        KeyCode::Char('x') => app.toggle_hex_view(),
-                        KeyCode::Char('e') => app.start_export(),
-                        KeyCode::Char('n') => app.start_create_file(),
-                        KeyCode::Char('N') => app.start_create_dir(),
-                        KeyCode::Char('d') => app.delete_selected()?,
-                        KeyCode::Char('r') => app.start_rename(),
-                        KeyCode::Char('R') => app.load_current_directory()?,
-                        KeyCode::Char('?') => app.toggle_help(),
-                        KeyCode::Esc => {
-                            if app.view == View::Help {
-                                app.view = View::Browser;
-                            } else if app.view == View::FileContent
-                                || app.view == View::HexView
-                                || app.view == View::ImageView
-                            {
-                                app.clear_view_data();
-                                app.view = View::Browser;
+                    InputMode::Normal => {
+                        // Handle popups first
+                        if app.show_delete_confirm {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete()?,
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_delete(),
+                                _ => {}
+                            }
+                        } else if app.show_help_popup {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('H') | KeyCode::Char('h') => app.close_help(),
+                                _ => {}
+                            }
+                        } else if app.show_browser_menu {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.browser_menu_previous(),
+                                KeyCode::Down | KeyCode::Char('j') => app.browser_menu_next(),
+                                KeyCode::Enter => app.execute_browser_menu_action(),
+                                KeyCode::Esc => app.close_browser_menu(),
+                                _ => {}
+                            }
+                        } else if app.view == View::FileActionMenu {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.menu_previous(),
+                                KeyCode::Down | KeyCode::Char('j') => app.menu_next(),
+                                KeyCode::Enter => app.execute_menu_action()?,
+                                KeyCode::Esc => app.close_file_menu(),
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    return Ok(());
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                                KeyCode::Down | KeyCode::Char('j') => app.next(),
+                                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                                    app.enter_selected()?
+                                }
+                                KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                                    app.go_parent()?
+                                }
+                                KeyCode::Char('v') => app.view_file()?,
+                                KeyCode::Char('x') => app.toggle_hex_view(),
+                                KeyCode::Char('E') => app.start_edit_file()?,
+                                KeyCode::Char('e') => app.start_export(),
+                                KeyCode::Char('n') => app.start_create_file(),
+                                KeyCode::Char('N') => app.start_create_dir(),
+                                KeyCode::Char('d') => app.delete_selected()?,
+                                KeyCode::Char('r') => app.start_rename(),
+                                KeyCode::Char('R') => app.load_current_directory()?,
+                                KeyCode::Char('F') => app.show_browser_context_menu(),
+                                KeyCode::Char('H') => app.show_help(),
+                                KeyCode::Char('?') => app.toggle_help(),
+                                KeyCode::Esc => {
+                                    if app.view == View::Help {
+                                        app.view = View::Browser;
+                                    } else if app.view == View::EditMode {
+                                        app.exit_edit_mode();
+                                    } else if app.view == View::FileContent
+                                        || app.view == View::HexView
+                                        || app.view == View::ImageView
+                                    {
+                                        app.clear_view_data();
+                                        app.view = View::Browser;
+                                    }
+                                }
+                                KeyCode::PageUp => app.scroll_up(20),
+                                KeyCode::PageDown => app.scroll_down(20),
+                                KeyCode::Home => app.scroll_to_top(),
+                                KeyCode::End => app.scroll_to_bottom(),
+                                _ => {}
                             }
                         }
-                        KeyCode::PageUp => app.scroll_up(20),
-                        KeyCode::PageDown => app.scroll_down(20),
-                        KeyCode::Home => app.scroll_to_top(),
-                        KeyCode::End => app.scroll_to_bottom(),
-                        _ => {}
-                    },
-                    InputMode::Input => match key.code {
-                        KeyCode::Enter => app.confirm_input()?,
-                        KeyCode::Esc => app.cancel_input(),
-                        KeyCode::Char(c) => app.input_buffer.push(c),
-                        KeyCode::Backspace => {
-                            app.input_buffer.pop();
+                    }
+                    InputMode::Input => {
+                        // Special handling for edit mode
+                        if app.view == View::EditMode {
+                            // Ctrl+S and F2 are handled globally above
+                            // Esc can also be handled by Ctrl+X globally, but keep traditional Esc here too
+                            if key.code == KeyCode::Esc {
+                                app.exit_edit_mode();
+                            } else {
+                                // Forward all other keys to textarea
+                                if let Some(textarea) = &mut app.text_editor {
+                                    textarea.input(key);
+                                }
+                            }
+                        } else {
+                            // Regular input mode (for prompts)
+                            match key.code {
+                                KeyCode::Enter => app.confirm_input()?,
+                                KeyCode::Esc => app.cancel_input(),
+                                KeyCode::Char(c) => app.input_buffer.push(c),
+                                KeyCode::Backspace => {
+                                    app.input_buffer.pop();
+                                }
+                                _ => {}
+                            }
                         }
-                        _ => {}
-                    },
+                    }
                 }
             }
         }
@@ -346,41 +444,82 @@ fn ui(f: &mut Frame, app: &mut FatApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
+            Constraint::Length(1), // Menu bar
+            Constraint::Length(2), // Header/path
             Constraint::Min(0),    // Main content
             Constraint::Length(3), // Footer/status
         ])
         .split(f.area());
 
-    // Header
+    // Menu bar at top
+    let menu_items = vec![
+        ("File", 'F'),
+        ("Help", 'H'),
+    ];
+
+    let menu_spans: Vec<Span> = menu_items
+        .iter()
+        .flat_map(|(label, hotkey)| {
+            vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    format!("{}", hotkey),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(
+                    &label[1..],
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(" ", Style::default()),
+            ]
+        })
+        .collect();
+
+    let menu_bar = Paragraph::new(Line::from(menu_spans))
+        .style(Style::default().bg(Color::DarkGray));
+    f.render_widget(menu_bar, chunks[0]);
+
+    // Header with path
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(
-            " FAT Browser ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | "),
-        Span::styled(
-            format!("/{}", app.current_path.join("/")),
-            Style::default().fg(Color::Yellow),
+            format!(" {} ", app.current_path.join("/")),
+            Style::default().fg(Color::Cyan),
         ),
         if app.read_only {
-            Span::styled(" [READ-ONLY]", Style::default().fg(Color::Red))
+            Span::styled("[READ-ONLY]", Style::default().fg(Color::Red))
         } else {
             Span::raw("")
         },
     ])])
-    .block(Block::default().borders(Borders::ALL).title("fatrs"));
-    f.render_widget(header, chunks[0]);
+    .block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(header, chunks[1]);
 
     // Main content based on view
     match app.view {
-        View::Browser => render_browser(f, app, chunks[1]),
-        View::FileContent => render_file_content(f, app, chunks[1]),
-        View::HexView => render_hex_view(f, app, chunks[1]),
-        View::ImageView => render_image_view(f, app, chunks[1]),
-        View::Help => render_help(f, chunks[1]),
+        View::Browser => render_browser(f, app, chunks[2]),
+        View::FileActionMenu => {
+            // Render browser first, then menu overlay
+            render_browser(f, app, chunks[2]);
+            render_file_action_menu(f, app, chunks[2]);
+        }
+        View::FileContent => render_file_content(f, app, chunks[2]),
+        View::HexView => render_hex_view(f, app, chunks[2]),
+        View::ImageView => render_image_view(f, app, chunks[2]),
+        View::EditMode => render_edit_mode(f, app, chunks[2]),
+        View::Help => render_help(f, chunks[2]),
+    }
+
+    // Render popups overlays
+    if app.show_help_popup {
+        render_help_popup(f, f.area());
+    }
+    if app.show_browser_menu {
+        render_browser_menu(f, app, chunks[2]);
+    }
+    if app.show_delete_confirm {
+        render_delete_confirm(f, app, f.area());
     }
 
     // Footer/status
@@ -449,12 +588,95 @@ fn ui(f: &mut Frame, app: &mut FatApp) {
         ]),
     };
     let status = status.block(Block::default().borders(Borders::ALL).title("Status"));
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 
     // Render popup for messages
     if let Some(ref msg) = app.message {
         render_popup(f, msg, f.area());
     }
+}
+
+fn render_file_action_menu(f: &mut Frame, app: &FatApp, area: Rect) {
+    if let Some(filename) = &app.menu_file {
+        // Create a centered popup
+        let popup_area = centered_rect(60, 50, area);
+
+        // Clear the background
+        f.render_widget(Clear, popup_area);
+
+        // Menu items based on read-only mode
+        let menu_items: Vec<&str> = if app.read_only {
+            vec!["View as Text", "View as Hex", "Export to Host"]
+        } else {
+            vec![
+                "View as Text",
+                "View as Hex",
+                "Edit File",
+                "Export to Host",
+                "Delete File",
+            ]
+        };
+
+        let items: Vec<ListItem> = menu_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let style = if i == app.menu_selection {
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(*item, style)))
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" File: {} ", filename))
+                .title_alignment(ratatui::layout::Alignment::Center),
+        );
+
+        f.render_widget(list, popup_area);
+
+        // Instructions at bottom
+        let instructions = Paragraph::new(" ↑/↓: Navigate  Enter: Select  Esc: Cancel ")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+
+        let instruction_area = Rect {
+            x: popup_area.x,
+            y: popup_area.y + popup_area.height - 1,
+            width: popup_area.width,
+            height: 1,
+        };
+
+        f.render_widget(instructions, instruction_area);
+    }
+}
+
+/// Helper to create a centered rectangle
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn render_browser(f: &mut Frame, app: &mut FatApp, area: Rect) {
@@ -633,6 +855,18 @@ fn render_image_view(f: &mut Frame, app: &FatApp, area: Rect) {
     }
 }
 
+fn render_edit_mode(f: &mut Frame, app: &mut FatApp, area: Rect) {
+    if let (Some(textarea), Some(filename)) = (&mut app.text_editor, &app.editing_file) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Editing: {} (F2 or Ctrl+S to save, Esc to exit) ", filename));
+
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(&*textarea, inner_area);
+    }
+}
+
 fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
         Line::from(Span::styled(
@@ -640,27 +874,28 @@ fn render_help(f: &mut Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from("  j/k or Up/Down    Move cursor"),
-        Line::from("  Enter/l/Right     Open file/directory"),
+        Line::from("  Enter/l/Right     Enter directory / Show file menu"),
         Line::from("  Backspace/h/Left  Go to parent directory"),
         Line::from("  PageUp/PageDown   Scroll content"),
         Line::from("  Home/End          Scroll to top/bottom"),
         Line::from(""),
         Line::from(Span::styled(
-            "Viewing",
+            "Quick Actions (or use Enter menu)",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  v                 View file as text"),
-        Line::from("  x                 View file as hex"),
+        Line::from("  v                 Quick view as text"),
+        Line::from("  x                 Quick view as hex"),
+        Line::from("  E                 Quick edit file"),
+        Line::from("  e                 Quick export to host"),
+        Line::from("  d                 Quick delete"),
         Line::from("  Esc               Close viewer"),
         Line::from(""),
         Line::from(Span::styled(
-            "File Operations",
+            "File Management",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  e                 Export file to local disk"),
         Line::from("  n                 Create new file"),
         Line::from("  N                 Create new directory"),
-        Line::from("  d                 Delete selected"),
         Line::from("  r                 Rename selected"),
         Line::from("  R                 Refresh directory"),
         Line::from(""),
@@ -676,6 +911,162 @@ fn render_help(f: &mut Frame, area: Rect) {
         Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title(" Help "));
 
     f.render_widget(paragraph, area);
+}
+
+fn render_help_popup(f: &mut Frame, area: Rect) {
+    // Large centered popup with shortcuts
+    let popup_area = centered_rect(80, 80, area);
+    f.render_widget(Clear, popup_area);
+
+    let help_text = vec![
+        Line::from(Span::styled(
+            "Keyboard Shortcuts",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Navigation", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  ↑/↓ or j/k           Move cursor"),
+        Line::from("  Enter/→/l            Enter directory / Show file menu"),
+        Line::from("  Backspace/←/h        Go to parent directory"),
+        Line::from("  PgUp/PgDn            Scroll content"),
+        Line::from(""),
+        Line::from(Span::styled("Quick Actions", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  v                    Quick view as text"),
+        Line::from("  x                    Quick view as hex"),
+        Line::from("  E                    Quick edit file (Ctrl+S to save)"),
+        Line::from("  e                    Quick export to host"),
+        Line::from("  d                    Quick delete"),
+        Line::from(""),
+        Line::from(Span::styled("File Management", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  F (File menu)        Create file/directory"),
+        Line::from("  n                    Create new file"),
+        Line::from("  N                    Create new directory"),
+        Line::from("  r                    Rename selected"),
+        Line::from("  R                    Refresh directory"),
+        Line::from(""),
+        Line::from(Span::styled("General", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  H (Help menu)        Show this help"),
+        Line::from("  ?                    Toggle help view"),
+        Line::from("  Esc                  Close dialog/viewer"),
+        Line::from("  q or Ctrl+C          Quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Press Esc or H to close ",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL).title(" Help - Keyboard Shortcuts "))
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(paragraph, popup_area);
+}
+
+fn render_browser_menu(f: &mut Frame, app: &FatApp, area: Rect) {
+    if app.read_only {
+        return; // No menu in read-only mode
+    }
+
+    let popup_area = centered_rect(50, 30, area);
+    f.render_widget(Clear, popup_area);
+
+    let menu_items = vec!["Create New File", "Create New Directory"];
+
+    let items: Vec<ListItem> = menu_items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == app.menu_selection {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(*item, style)))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" File Menu ")
+            .title_alignment(ratatui::layout::Alignment::Center),
+    );
+
+    f.render_widget(list, popup_area);
+
+    let instructions = Paragraph::new(" ↑/↓: Navigate  Enter: Select  Esc: Cancel ")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+
+    let instruction_area = Rect {
+        x: popup_area.x,
+        y: popup_area.y + popup_area.height - 1,
+        width: popup_area.width,
+        height: 1,
+    };
+
+    f.render_widget(instructions, instruction_area);
+}
+
+fn render_delete_confirm(f: &mut Frame, app: &FatApp, area: Rect) {
+    if let Some(target) = &app.delete_target {
+        let popup_area = centered_rect(60, 25, area);
+        f.render_widget(Clear, popup_area);
+
+        // Extract just the filename from the path
+        let filename = target.split('/').last().unwrap_or(target);
+
+        let text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Delete File?",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                filename,
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This action cannot be undone!",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" ⚠ Confirm Deletion ")
+                    .title_alignment(ratatui::layout::Alignment::Center),
+            )
+            .alignment(ratatui::layout::Alignment::Center);
+
+        f.render_widget(paragraph, popup_area);
+
+        let instructions = Paragraph::new(" Y: Yes, delete  N/Esc: Cancel ")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+
+        let instruction_area = Rect {
+            x: popup_area.x,
+            y: popup_area.y + popup_area.height - 1,
+            width: popup_area.width,
+            height: 1,
+        };
+
+        f.render_widget(instructions, instruction_area);
+    }
 }
 
 fn render_popup(f: &mut Frame, message: &str, area: Rect) {

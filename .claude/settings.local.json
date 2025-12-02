@@ -9,7 +9,11 @@
       "WebFetch(domain:docs.rs)",
       "Bash(mkdir:*)",
       "Bash(cargo clippy:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(target/release/fatrs.exe create:*)",
+      "Bash(target/release/fatrs.exe cp:*)",
+      "Bash(target/release/fatrs.exe cat:*)",
+      "Bash(sed:*)"
     ],
     "deny": [],
     "ask": []

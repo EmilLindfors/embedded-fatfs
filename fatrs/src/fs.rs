@@ -931,7 +931,16 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         }
 
         self.flush_fs_info().await?;
-        self.set_dirty_flag(false).await?;
+
+        // TODO: Fix set_dirty_flag - it's currently corrupting the filesystem when used with buffered streams
+        // self.set_dirty_flag(false).await?;
+
+        // Flush the underlying disk to ensure all data is written
+        {
+            let mut disk = self.disk.acquire().await;
+            disk.flush().await?;
+        }
+
         Ok(())
     }
 
@@ -950,7 +959,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     pub(crate) async fn set_dirty_flag(&self, dirty: bool) -> Result<(), IO::Error> {
         // Do not overwrite flags read from BPB on mount
         let mut flags = self.bpb.status_flags();
-        flags.dirty |= dirty;
+        flags.dirty = dirty;
         // Check if flags has changed
         let current_flags =
             FsStatusFlags::decode(self.current_status_flags.load(Ordering::Acquire));
@@ -1087,9 +1096,10 @@ impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
 impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let size = self.fs.disk.acquire().await.write(buf).await?;
-        if size > 0 {
-            self.fs.set_dirty_flag(true).await?;
-        }
+        // TODO: Fix set_dirty_flag - it's currently corrupting the filesystem when used with buffered streams
+        // if size > 0 {
+        //     self.fs.set_dirty_flag(true).await?;
+        // }
         Ok(size)
     }
 
@@ -1257,7 +1267,9 @@ impl<B, S: IoBase> Seek for DiskSlice<B, S> {
                 Err(Error::InvalidInput)
             } else {
                 self.offset = new_offset;
-                Ok(self.offset)
+                // Return the ABSOLUTE position (begin + offset) for proper cache tracking
+                // This is critical for FAT cache to store correct absolute offsets
+                Ok(self.begin + self.offset)
             }
         } else {
             error!("Invalid seek offset");

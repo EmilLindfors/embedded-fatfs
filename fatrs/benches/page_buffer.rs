@@ -8,8 +8,7 @@ use tokio::fs;
 
 use aligned::{A4, Aligned};
 use embedded_io_async::{ErrorType, Read, Seek, SeekFrom, Write};
-use fatrs_adapters_alloc::{LargePageStream, presets};
-use fatrs_adapters_core::PageStream;
+use fatrs_adapters::{LargePageStream, PageStream, presets};
 use fatrs_block_device::BlockDevice;
 
 const BLOCK_SIZE: usize = 512;
@@ -220,7 +219,7 @@ async fn benchmark_sequential_write(name: &str, page_size: usize, data_mb: usize
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
     let block_dev = FileBlockDevice(io);
-    let mut stream = LargePageStream::new(block_dev, page_size);
+    let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     let chunk = vec![0xAAu8; 64 * 1024]; // 64KB write chunks
     let total_bytes = data_mb * 1024 * 1024;
@@ -263,7 +262,7 @@ async fn benchmark_sequential_read(name: &str, page_size: usize, data_mb: usize)
     {
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
         let block_dev = FileBlockDevice(io);
-        let mut stream = LargePageStream::new(block_dev, page_size);
+        let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
         let chunk = vec![0xBBu8; 64 * 1024];
         let iterations = total_bytes / chunk.len();
@@ -283,7 +282,7 @@ async fn benchmark_sequential_read(name: &str, page_size: usize, data_mb: usize)
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
     let block_dev = FileBlockDevice(io);
-    let mut stream = LargePageStream::new(block_dev, page_size);
+    let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     let mut buf = vec![0u8; 64 * 1024]; // 64KB read chunks
     let mut total_read = 0usize;
@@ -328,7 +327,7 @@ async fn benchmark_random_access(name: &str, page_size: usize, num_accesses: usi
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
     let block_dev = FileBlockDevice(io);
-    let mut stream = LargePageStream::new(block_dev, page_size);
+    let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     // Generate deterministic "random" offsets
     let mut offsets: Vec<u64> = (0..num_accesses)
@@ -468,7 +467,7 @@ async fn benchmark_stack_page_stream() {
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
         let block_dev = FileBlockDevice(io);
-        let mut stream = LargePageStream::new(block_dev, presets::PAGE_4K);
+        let mut stream = LargePageStream::new_unwrap(block_dev, presets::PAGE_4K);
 
         let chunk = vec![0xCCu8; 64 * 1024];
         let total_bytes = data_mb * 1024 * 1024;
@@ -509,7 +508,7 @@ async fn benchmark_stack_page_stream() {
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
         let block_dev = FileBlockDevice(io);
-        let mut stream = LargePageStream::new(block_dev, presets::PAGE_128K);
+        let mut stream = LargePageStream::new_unwrap(block_dev, presets::PAGE_128K);
 
         let chunk = vec![0xCCu8; 64 * 1024];
         let total_bytes = data_mb * 1024 * 1024;

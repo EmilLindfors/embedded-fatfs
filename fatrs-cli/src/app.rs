@@ -4,15 +4,18 @@ use anyhow::Result;
 use fatrs::{FileSystem, OemCpConverter, ReadWriteSeek, TimeProvider};
 use ratatui::widgets::ListState;
 use tokio::runtime::Handle;
+use tui_textarea::TextArea;
 
 /// Current view mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum View {
     Browser,
+    FileActionMenu,
     FileContent,
     HexView,
     ImageView,
+    EditMode,
     Help,
 }
 
@@ -82,6 +85,22 @@ where
     pub image_data: Option<image::DynamicImage>,
     /// Message to display
     pub message: Option<String>,
+    /// Text editor for edit mode
+    pub text_editor: Option<TextArea<'static>>,
+    /// File being edited
+    pub editing_file: Option<String>,
+    /// Menu selection index
+    pub menu_selection: usize,
+    /// File selected for menu actions
+    pub menu_file: Option<String>,
+    /// Show help popup
+    pub show_help_popup: bool,
+    /// Show browser context menu (for creating files/dirs)
+    pub show_browser_menu: bool,
+    /// Show delete confirmation dialog
+    pub show_delete_confirm: bool,
+    /// Target file/directory for deletion
+    pub delete_target: Option<String>,
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> App<IO, TP, OCC>
@@ -112,6 +131,14 @@ where
             total_lines: 0,
             image_data: None,
             message: None,
+            text_editor: None,
+            editing_file: None,
+            menu_selection: 0,
+            menu_file: None,
+            show_help_popup: false,
+            show_browser_menu: false,
+            show_delete_confirm: false,
+            delete_target: None,
         })
     }
 
@@ -233,7 +260,7 @@ where
         self.list_state.selected().and_then(|i| self.entries.get(i))
     }
 
-    /// Enter the selected item (directory or view file)
+    /// Enter the selected item (directory or show file menu)
     pub fn enter_selected(&mut self) -> Result<()> {
         if let Some(entry) = self.get_selected_entry().cloned() {
             if entry.is_dir {
@@ -243,9 +270,82 @@ where
                 self.current_path.push(entry.name);
                 self.load_current_directory()?;
             } else {
-                self.view_file()?;
+                // Show file action menu for files
+                self.show_file_menu(entry.name);
             }
         }
+        Ok(())
+    }
+
+    /// Show file action menu
+    pub fn show_file_menu(&mut self, filename: String) {
+        self.menu_file = Some(filename);
+        self.menu_selection = 0;
+        self.view = View::FileActionMenu;
+    }
+
+    /// Close file action menu
+    pub fn close_file_menu(&mut self) {
+        self.menu_file = None;
+        self.menu_selection = 0;
+        self.view = View::Browser;
+    }
+
+    /// Navigate menu selection down
+    pub fn menu_next(&mut self) {
+        let menu_items = if self.read_only { 3 } else { 5 }; // Read-only: View/Hex/Export, Edit: +Edit/Delete
+        self.menu_selection = (self.menu_selection + 1) % menu_items;
+    }
+
+    /// Navigate menu selection up
+    pub fn menu_previous(&mut self) {
+        let menu_items = if self.read_only { 3 } else { 5 };
+        self.menu_selection = if self.menu_selection == 0 {
+            menu_items - 1
+        } else {
+            self.menu_selection - 1
+        };
+    }
+
+    /// Execute selected menu action
+    pub fn execute_menu_action(&mut self) -> Result<()> {
+        if self.menu_file.is_none() {
+            return Ok(());
+        }
+
+        // Map selection to action based on read-only mode
+        let action = if self.read_only {
+            match self.menu_selection {
+                0 => "view",
+                1 => "hex",
+                2 => "export",
+                _ => return Ok(()),
+            }
+        } else {
+            match self.menu_selection {
+                0 => "view",
+                1 => "hex",
+                2 => "edit",
+                3 => "export",
+                4 => "delete",
+                _ => return Ok(()),
+            }
+        };
+
+        self.close_file_menu();
+
+        match action {
+            "view" => self.view_file()?,
+            "hex" => {
+                self.view_file()?;
+                self.toggle_hex_view();
+            }
+            "edit" => self.start_edit_file()?,
+            "export" => self.start_export(),
+            "delete" => self.delete_selected()?,
+            _ => {}
+        }
+
         Ok(())
     }
 
@@ -381,6 +481,62 @@ where
         };
     }
 
+    /// Show help popup
+    pub fn show_help(&mut self) {
+        self.show_help_popup = true;
+    }
+
+    /// Close help popup
+    pub fn close_help(&mut self) {
+        self.show_help_popup = false;
+    }
+
+    /// Show browser context menu (for creating files/dirs)
+    pub fn show_browser_context_menu(&mut self) {
+        self.show_browser_menu = true;
+        self.menu_selection = 0;
+    }
+
+    /// Close browser context menu
+    pub fn close_browser_menu(&mut self) {
+        self.show_browser_menu = false;
+        self.menu_selection = 0;
+    }
+
+    /// Navigate browser menu
+    pub fn browser_menu_next(&mut self) {
+        let items = if self.read_only { 0 } else { 2 }; // Create File, Create Directory
+        if items > 0 {
+            self.menu_selection = (self.menu_selection + 1) % items;
+        }
+    }
+
+    pub fn browser_menu_previous(&mut self) {
+        let items = if self.read_only { 0 } else { 2 };
+        if items > 0 {
+            self.menu_selection = if self.menu_selection == 0 {
+                items - 1
+            } else {
+                self.menu_selection - 1
+            };
+        }
+    }
+
+    /// Execute browser menu action
+    pub fn execute_browser_menu_action(&mut self) {
+        if self.read_only {
+            return;
+        }
+
+        match self.menu_selection {
+            0 => self.start_create_file(),
+            1 => self.start_create_dir(),
+            _ => {}
+        }
+
+        self.close_browser_menu();
+    }
+
     /// Clear view data when returning to browser
     pub fn clear_view_data(&mut self) {
         self.file_content = None;
@@ -477,6 +633,121 @@ where
         }
     }
 
+    /// Start editing selected file
+    pub fn start_edit_file(&mut self) -> Result<()> {
+        if self.read_only {
+            self.message = Some("Cannot edit: mounted read-only".to_string());
+            return Ok(());
+        }
+
+        let entry_info = self
+            .get_selected_entry()
+            .map(|e| (e.name.clone(), e.is_dir));
+
+        if let Some((name, is_dir)) = entry_info {
+            if is_dir {
+                self.message = Some("Cannot edit directories".to_string());
+                return Ok(());
+            }
+
+            // Read file content
+            let root = self.fs.root_dir();
+            let path = if self.current_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", self.current_path.join("/"), name)
+            };
+
+            let content = self.runtime.block_on(async {
+                let mut file = root
+                    .open_file(&path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to open file: {:?}", e))?;
+
+                // Read file content
+                use embedded_io_async::Read;
+                let mut buffer = Vec::new();
+                let mut temp = [0u8; 512];
+                loop {
+                    let n = file
+                        .read(&mut temp)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to read file: {:?}", e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&temp[..n]);
+                }
+
+                // Try to convert to UTF-8
+                String::from_utf8(buffer).map_err(|_| {
+                    anyhow::anyhow!("File is not valid UTF-8. Cannot edit binary files.")
+                })
+            })?;
+
+            // Create text editor with file content
+            let mut textarea = TextArea::new(content.lines().map(String::from).collect());
+            textarea.set_line_number_style(ratatui::style::Style::default());
+
+            self.text_editor = Some(textarea);
+            self.editing_file = Some(name);
+            self.view = View::EditMode;
+            self.input_mode = InputMode::Input;
+        }
+
+        Ok(())
+    }
+
+    /// Save edited file
+    pub fn save_edited_file(&mut self) -> Result<()> {
+        if let (Some(textarea), Some(filename)) = (&self.text_editor, &self.editing_file) {
+            let content = textarea.lines().join("\n");
+            let filename = filename.clone();
+
+            let root = self.fs.root_dir();
+            let path = if self.current_path.is_empty() {
+                filename.clone()
+            } else {
+                format!("{}/{}", self.current_path.join("/"), filename)
+            };
+
+            self.runtime.block_on(async {
+                // Delete old file and create new one with updated content
+                root.remove(&path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to remove old file: {:?}", e))?;
+
+                let mut file = root
+                    .create_file(&path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create file: {:?}", e))?;
+
+                use embedded_io_async::Write;
+                file.write_all(content.as_bytes())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to write file: {:?}", e))?;
+
+                file.flush()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to flush file: {:?}", e))?;
+
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+            self.message = Some(format!("Saved '{}'", filename));
+        }
+
+        Ok(())
+    }
+
+    /// Exit edit mode
+    pub fn exit_edit_mode(&mut self) {
+        self.text_editor = None;
+        self.editing_file = None;
+        self.view = View::Browser;
+        self.input_mode = InputMode::Normal;
+    }
+
     /// Cancel input mode
     pub fn cancel_input(&mut self) {
         self.input_mode = InputMode::Normal;
@@ -565,7 +836,7 @@ where
         Ok(())
     }
 
-    /// Delete the selected item
+    /// Show delete confirmation dialog
     pub fn delete_selected(&mut self) -> Result<()> {
         if self.read_only {
             self.message = Some("Cannot delete: mounted read-only".to_string());
@@ -580,7 +851,17 @@ where
                 format!("{}/{}", self.current_path.join("/"), entry.name)
             };
 
-            let entry_name = entry.name.clone();
+            self.delete_target = Some(path);
+            self.show_delete_confirm = true;
+        }
+
+        Ok(())
+    }
+
+    /// Confirm and execute deletion
+    pub fn confirm_delete(&mut self) -> Result<()> {
+        if let Some(path) = self.delete_target.take() {
+            let path_clone = path.clone();
             let result: Result<(), String> = self.runtime.block_on(async {
                 let root = self.fs.root_dir();
                 root.remove(&path).await.map_err(|e| format!("{:?}", e))
@@ -588,7 +869,7 @@ where
 
             match result {
                 Ok(_) => {
-                    self.message = Some(format!("Deleted: {}", entry_name));
+                    self.message = Some(format!("Deleted: {}", path_clone));
                 }
                 Err(e) => {
                     self.message = Some(format!("Error deleting: {}", e));
@@ -598,7 +879,14 @@ where
             self.load_current_directory()?;
         }
 
+        self.show_delete_confirm = false;
         Ok(())
+    }
+
+    /// Cancel deletion
+    pub fn cancel_delete(&mut self) {
+        self.show_delete_confirm = false;
+        self.delete_target = None;
     }
 
     /// Rename the selected item

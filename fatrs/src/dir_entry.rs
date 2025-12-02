@@ -470,6 +470,9 @@ pub(crate) struct DirEntryEditor {
     data: DirFileEntryData,
     pos: u64,
     dirty: bool,
+    // TODO (Phase 2): Add generation counter to detect stale positions
+    // when directory clusters are reallocated. For now, immediate flushing
+    // after writes prevents the corruption scenario.
 }
 
 impl DirEntryEditor {
@@ -545,6 +548,10 @@ impl DirEntryEditor {
     ) -> Result<(), IO::Error> {
         {
             let mut disk = fs.disk.acquire().await;
+            // NOTE: This position was cached at directory entry creation time.
+            // In Phase 2, we should add validation that the position is still valid
+            // (i.e., directory hasn't been reallocated). For now, immediate flushing
+            // after each write prevents stale position issues.
             disk.seek(io::SeekFrom::Start(self.pos)).await?;
             self.data.serialize(&mut *disk).await?;
         }

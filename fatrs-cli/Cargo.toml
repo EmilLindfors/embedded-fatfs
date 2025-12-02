@@ -12,9 +12,8 @@ rust-version = "1.85"
 
 [dependencies]
 # Core fatrs ecosystem
-fatrs = { path = "../fatrs", features = ["transaction-safe", "std", "alloc", "lfn", "unicode", "log", "chrono"] }
-fatrs-adapters-core = { path = "../fatrs-adapters-core", features = ["std"] }
-fatrs-adapters-alloc = { path = "../fatrs-adapters-alloc" }
+fatrs = { path = "../fatrs", features = ["transaction-safe", "std", "alloc", "lfn", "unicode", "log", "chrono"], default-features = false }
+fatrs-adapters = { path = "../fatrs-adapters", features = ["std", "alloc"] }
 fatrs-block-device = { path = "../fatrs-block-device" }
 fatrs-block-platform = { path = "../fatrs-block-platform", features = ["windows"] }
 fatrs-fuse = { path = "../fatrs-fuse", optional = true }
@@ -39,6 +38,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 image = "0.25"
 ratatui-image = "1.0"
+tui-textarea = "0.7"
 
 # Windows dependencies
 [target.'cfg(windows)'.dependencies]

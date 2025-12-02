@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use embedded_io_adapters::tokio_1::FromTokio;
 use fatrs::{FatType, FormatVolumeOptions, FsOptions};
-use fatrs_adapters_alloc::{LargePageStream, presets};
+use fatrs_adapters::{LargePageStream, presets};
 use fatrs_block_platform::StreamBlockDevice;
 
 /// Page size presets for I/O buffering
@@ -111,10 +111,10 @@ pub enum Command {
         /// Path to FAT filesystem image
         image: PathBuf,
 
-        /// Source path (prefix with : for paths inside the image)
+        /// Source path (host filesystem or inside image with : prefix)
         source: String,
 
-        /// Destination path (prefix with : for paths inside the image)
+        /// Destination path (host filesystem or inside image with : prefix)
         dest: String,
 
         /// Recursively copy directories
@@ -275,7 +275,9 @@ fn format_size(size: u64) -> String {
 
 /// Get the effective page size in bytes (default to 4KB for minimal buffering)
 fn effective_page_size(page_size: PageSize) -> usize {
-    page_size.to_bytes().unwrap_or(presets::PAGE_4K)
+    // TEMPORARY: Use 512-byte pages (no buffering) to test if corruption persists
+    512
+    //page_size.to_bytes().unwrap_or(presets::PAGE_4K)
 }
 
 /// Open a FAT filesystem image with large page buffering
@@ -299,7 +301,8 @@ async fn open_fs_buffered(
         .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
     let block_dev = StreamBlockDevice(FromTokio::new(file));
-    let stream = LargePageStream::new(block_dev, page_size);
+    let stream = LargePageStream::new(block_dev, page_size)
+        .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
     let fs = fatrs::FileSystem::new(stream, FsOptions::new())
         .await
@@ -549,44 +552,71 @@ async fn cmd_cp(
     recursive: bool,
     page_size: usize,
 ) -> Result<()> {
-    // Paths prefixed with : are inside the image
-    let src_in_image = source.starts_with(':');
-    let dst_in_image = dest.starts_with(':');
+    // Detect whether paths are in the image or on the host
+    // Paths prefixed with : are explicitly inside the image
+    // Otherwise, check if the path exists on the host filesystem
+    let src_explicit_image = source.starts_with(':');
+    let dst_explicit_image = dest.starts_with(':');
 
     let src_path = source.trim_start_matches(':');
     let dst_path = dest.trim_start_matches(':');
 
+    // Determine actual location of source and destination
+    let src_in_image = if src_explicit_image {
+        true
+    } else {
+        // If source doesn't exist on host, assume it's in the image
+        !std::path::Path::new(src_path).exists()
+    };
+
+    let dst_in_image = if dst_explicit_image {
+        true
+    } else {
+        // If destination doesn't exist on host and source is in image, assume dest is on host
+        // If source is on host, assume dest is in image
+        !src_in_image
+    };
+
     if src_in_image && dst_in_image {
-        anyhow::bail!("Cannot copy within the same image (both paths start with :)");
+        anyhow::bail!("Cannot copy within the same image. To copy from image to host, ensure the destination path exists or is a valid host path.");
     }
 
     if !src_in_image && !dst_in_image {
-        anyhow::bail!("At least one path must be inside the image (prefix with :)");
+        anyhow::bail!("Cannot copy within host filesystem. Use standard tools like 'cp' instead. To copy to/from the image, use : prefix or ensure one path is in the image.");
     }
 
     let (fs, _) = open_fs_buffered(image, dst_in_image, page_size).await?;
 
-    let root = fs.root_dir();
+    let result = {
+        let root = fs.root_dir();
 
-    if src_in_image {
-        // Copy from image to host filesystem
-        copy_from_image(
-            &root,
-            src_path.trim_start_matches('/'),
-            Path::new(dst_path),
-            recursive,
-        )
-        .await
-    } else {
-        // Copy from host filesystem to image
-        copy_to_image(
-            &root,
-            Path::new(src_path),
-            dst_path.trim_start_matches('/'),
-            recursive,
-        )
-        .await
-    }
+        if src_in_image {
+            // Copy from image to host filesystem
+            println!("Copying from image:{} to host:{}", src_path, dst_path);
+            copy_from_image(
+                &root,
+                src_path.trim_start_matches('/'),
+                Path::new(dst_path),
+                recursive,
+            )
+            .await
+        } else {
+            // Copy from host filesystem to image
+            println!("Copying from host:{} to image:{}", src_path, dst_path);
+            copy_to_image(
+                &root,
+                Path::new(src_path),
+                dst_path.trim_start_matches('/'),
+                recursive,
+            )
+            .await
+        }
+    }; // root is dropped here
+
+    // Always unmount the filesystem to ensure all changes are flushed
+    fs.unmount().await?;
+
+    result
 }
 
 async fn copy_from_image<IO: fatrs::ReadWriteSeek>(
@@ -737,48 +767,60 @@ where
 async fn cmd_mkdir(image: &Path, path: &str, parents: bool, page_size: usize) -> Result<()> {
     let (fs, _) = open_fs_buffered(image, true, page_size).await?;
 
-    let root = fs.root_dir();
-    let path = path.trim_start_matches('/');
+    {
+        let root = fs.root_dir();
+        let path = path.trim_start_matches('/');
 
-    if parents {
-        // Create parent directories as needed
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let mut current = String::new();
+        if parents {
+            // Create parent directories as needed
+            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let mut current = String::new();
 
-        for part in parts {
-            if !current.is_empty() {
-                current.push('/');
+            for part in parts {
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(part);
+
+                // Try to create, ignore if exists
+                root.create_dir(&current).await.ok();
             }
-            current.push_str(part);
-
-            // Try to create, ignore if exists
-            root.create_dir(&current).await.ok();
+        } else {
+            root.create_dir(path)
+                .await
+                .with_context(|| format!("Failed to create directory: {}", path))?;
         }
-    } else {
-        root.create_dir(path)
-            .await
-            .with_context(|| format!("Failed to create directory: {}", path))?;
-    }
 
-    println!("Created directory: {}", path);
+        println!("Created directory: {}", path);
+    } // root is dropped here
+
+    // Unmount to flush changes
+    fs.unmount().await?;
+
     Ok(())
 }
 
 async fn cmd_rm(image: &Path, path: &str, recursive: bool, page_size: usize) -> Result<()> {
     let (fs, _) = open_fs_buffered(image, true, page_size).await?;
 
-    let root = fs.root_dir();
-    let path = path.trim_start_matches('/');
+    {
+        let root = fs.root_dir();
+        let path = path.trim_start_matches('/');
 
-    if recursive {
-        remove_recursive(&root, path).await?;
-    } else {
-        root.remove(path)
-            .await
-            .with_context(|| format!("Failed to remove: {}", path))?;
-    }
+        if recursive {
+            remove_recursive(&root, path).await?;
+        } else {
+            root.remove(path)
+                .await
+                .with_context(|| format!("Failed to remove: {}", path))?;
+        }
 
-    println!("Removed: {}", path);
+        println!("Removed: {}", path);
+    } // root is dropped here
+
+    // Unmount to flush changes
+    fs.unmount().await?;
+
     Ok(())
 }
 
@@ -879,7 +921,8 @@ async fn cmd_create(
 
         // Wrap in LargePageStream for efficient copying
         let block_dev = StreamBlockDevice(io);
-        let stream = LargePageStream::new(block_dev, page_size);
+        let stream = LargePageStream::new(block_dev, page_size)
+            .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
         let fs = fatrs::FileSystem::new(stream, FsOptions::new())
             .await
@@ -1101,7 +1144,7 @@ async fn open_flash_device(
     >,
     usize,
 )> {
-    use fatrs_adapters_alloc::LargePageStream;
+    use fatrs_adapters::LargePageStream;
     use fatrs_block_platform::StreamBlockDevice;
 
     let windows_device = fatrs_cli::AsyncWindowsDevice::open(device, writable)
@@ -1109,7 +1152,8 @@ async fn open_flash_device(
         .with_context(|| format!("Failed to open device: {}", device))?;
 
     let block_dev = StreamBlockDevice(windows_device);
-    let stream = LargePageStream::new(block_dev, page_size);
+    let stream = LargePageStream::new(block_dev, page_size)
+        .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
     let fs = fatrs::FileSystem::new(stream, FsOptions::new())
         .await

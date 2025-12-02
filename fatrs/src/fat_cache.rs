@@ -75,9 +75,12 @@ impl FatCache {
         (offset / u64::from(self.sector_size)) * u64::from(self.sector_size)
     }
 
-    /// Find a cached sector by offset
-    fn find_sector(&mut self, offset: u64) -> Option<usize> {
-        let sector_offset = self.sector_offset(offset);
+    /// Find a cached sector by absolute offset
+    ///
+    /// Note: This now expects absolute offsets, not relative ones!
+    /// The sector.offset is now the absolute disk offset returned by seek().
+    fn find_sector(&mut self, absolute_offset: u64) -> Option<usize> {
+        let sector_offset = self.sector_offset(absolute_offset);
         for (idx, slot) in self.sectors.iter().enumerate() {
             if let Some(sector) = slot {
                 if sector.offset == sector_offset {
@@ -120,10 +123,14 @@ impl FatCache {
         Error<E>: From<S::Error>,
     {
         let sector_offset = self.sector_offset(offset);
-        let offset_in_sector = (offset - sector_offset) as usize;
 
-        // Check cache
-        if let Some(idx) = self.find_sector(offset) {
+        // Seek first to get the absolute offset (for DiskSlice compatibility)
+        let absolute_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
+        let absolute_sector_offset = self.sector_offset(absolute_offset);
+        let offset_in_sector = (absolute_offset - absolute_sector_offset) as usize;
+
+        // Check cache using absolute offset
+        if let Some(idx) = self.find_sector(absolute_offset) {
             // Cache hit!
             self.hits += 1;
             let sector = self.sectors[idx].as_mut().unwrap();
@@ -159,17 +166,18 @@ impl FatCache {
             }
         }
 
-        // Read new sector
-        storage.seek(SeekFrom::Start(sector_offset)).await?;
+        // Re-seek to the sector we want to read (may have changed during writeback)
+        let actual_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
         let mut sector_data = [0u8; 4096];
         let bytes_read = storage
             .read(&mut sector_data[..self.sector_size as usize])
             .await?;
 
-        // Cache the sector
+        // Cache the sector with the ACTUAL absolute offset from the seek
+        // This is critical for DiskSlice which translates relative to absolute offsets
         self.access_counter = self.access_counter.wrapping_add(1);
         self.sectors[slot_idx] = Some(CachedFatSector {
-            offset: sector_offset,
+            offset: actual_offset,
             data: sector_data,
             valid_len: bytes_read,
             dirty: false,
@@ -195,10 +203,14 @@ impl FatCache {
         Error<E>: From<S::Error>,
     {
         let sector_offset = self.sector_offset(offset);
-        let offset_in_sector = (offset - sector_offset) as usize;
 
-        // Check if sector is in cache
-        let slot_idx = if let Some(idx) = self.find_sector(offset) {
+        // Seek first to get the absolute offset (for DiskSlice compatibility)
+        let absolute_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
+        let absolute_sector_offset = self.sector_offset(absolute_offset);
+        let offset_in_sector = (absolute_offset - absolute_sector_offset) as usize;
+
+        // Check if sector is in cache using absolute offset
+        let slot_idx = if let Some(idx) = self.find_sector(absolute_offset) {
             self.hits += 1;
             idx
         } else {
@@ -223,8 +235,8 @@ impl FatCache {
                 }
             }
 
-            // Read existing sector (for partial writes)
-            storage.seek(SeekFrom::Start(sector_offset)).await?;
+            // Re-seek and read existing sector (for partial writes)
+            let actual_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
             let mut sector_data = [0u8; 4096];
             let bytes_read = storage
                 .read(&mut sector_data[..self.sector_size as usize])
@@ -232,7 +244,7 @@ impl FatCache {
 
             self.access_counter = self.access_counter.wrapping_add(1);
             self.sectors[slot_idx] = Some(CachedFatSector {
-                offset: sector_offset,
+                offset: actual_offset,
                 data: sector_data,
                 valid_len: bytes_read,
                 dirty: false,
