@@ -10,7 +10,7 @@ use core::char;
 use core::cmp;
 use core::fmt::Debug;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[cfg(all(not(feature = "std"), feature = "alloc", feature = "lfn"))]
 use alloc::string::String;
@@ -251,6 +251,36 @@ impl FsInfoSector {
     }
 }
 
+/// Configuration for transaction log
+#[cfg(feature = "transaction-safe")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Copy, Clone, Debug)]
+pub struct TransactionLogConfig {
+    /// Starting sector for transaction log area.
+    /// Set to 0 for automatic placement (before data area).
+    pub log_start_sector: u32,
+    /// Number of sectors allocated for transaction log (typically 4)
+    pub log_sector_count: u32,
+}
+
+#[cfg(feature = "transaction-safe")]
+impl TransactionLogConfig {
+    /// Create a new configuration with automatic log placement
+    pub fn automatic() -> Self {
+        Self {
+            log_start_sector: 0, // 0 means automatic placement
+            log_sector_count: 4, // 4 sectors = 2KB (supports 4 concurrent transactions)
+        }
+    }
+}
+
+#[cfg(feature = "transaction-safe")]
+impl Default for TransactionLogConfig {
+    fn default() -> Self {
+        Self::automatic()
+    }
+}
+
 /// A FAT filesystem mount options.
 ///
 /// Options are specified as an argument for `FileSystem::new` method.
@@ -260,6 +290,8 @@ pub struct FsOptions<TP, OCC> {
     pub(crate) update_accessed_date: bool,
     pub(crate) oem_cp_converter: OCC,
     pub(crate) time_provider: TP,
+    #[cfg(feature = "transaction-safe")]
+    pub(crate) transaction_log_config: Option<TransactionLogConfig>,
 }
 
 impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
@@ -270,6 +302,8 @@ impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
             update_accessed_date: false,
             oem_cp_converter: LossyOemCpConverter::new(),
             time_provider: DefaultTimeProvider::new(),
+            #[cfg(feature = "transaction-safe")]
+            transaction_log_config: None,
         }
     }
 }
@@ -291,6 +325,8 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             update_accessed_date: self.update_accessed_date,
             oem_cp_converter,
             time_provider: self.time_provider,
+            #[cfg(feature = "transaction-safe")]
+            transaction_log_config: self.transaction_log_config,
         }
     }
 
@@ -300,7 +336,59 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             update_accessed_date: self.update_accessed_date,
             oem_cp_converter: self.oem_cp_converter,
             time_provider,
+            #[cfg(feature = "transaction-safe")]
+            transaction_log_config: self.transaction_log_config,
         }
+    }
+
+    /// Enable transaction-safe mode with automatic log placement.
+    ///
+    /// This enables power-loss resilient metadata writes using a two-phase commit protocol.
+    /// The transaction log will be automatically placed in reserved sectors before the data area.
+    ///
+    /// Note: The log location is calculated at mount time based on the filesystem layout,
+    /// not when this method is called. This ensures correct placement regardless of volume size.
+    ///
+    /// Only available when `transaction-safe` feature is enabled.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let options = FsOptions::new()
+    ///     .with_transaction_log();
+    /// let fs = FileSystem::new(disk, options).await?;
+    /// ```
+    #[cfg(feature = "transaction-safe")]
+    #[must_use]
+    pub fn with_transaction_log(mut self) -> Self {
+        self.transaction_log_config = Some(TransactionLogConfig::automatic());
+        self
+    }
+
+    /// Enable transaction-safe mode with custom configuration.
+    ///
+    /// This allows you to specify the exact location and size of the transaction log.
+    /// Use this if you need fine-grained control over where the transaction log is stored.
+    ///
+    /// Only available when `transaction-safe` feature is enabled.
+    ///
+    /// # Arguments
+    /// * `log_start_sector` - First sector to use for transaction log
+    /// * `log_sector_count` - Number of sectors to allocate (typically 4)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let options = FsOptions::new()
+    ///     .with_transaction_log_at(100, 8); // 8 sectors for larger log
+    /// let fs = FileSystem::new(disk, options).await?;
+    /// ```
+    #[cfg(feature = "transaction-safe")]
+    #[must_use]
+    pub fn with_transaction_log_at(mut self, log_start_sector: u32, log_sector_count: u32) -> Self {
+        self.transaction_log_config = Some(TransactionLogConfig {
+            log_start_sector,
+            log_sector_count,
+        });
+        self
     }
 }
 
@@ -351,6 +439,9 @@ where
     /// Status flags stored as atomic u8 for thread safety (Send + Sync)
     /// Bit 0: dirty, Bit 1: io_error
     current_status_flags: AtomicU8,
+    /// Generation counter incremented on cluster deallocation
+    /// Used to detect stale directory entry positions
+    pub(crate) cluster_generation: AtomicU64,
     #[cfg(feature = "fat-cache")]
     pub(crate) fat_cache: Shared<crate::fat_cache::FatCache>,
     #[cfg(feature = "dir-cache")]
@@ -394,6 +485,23 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ///
     /// Note: creating multiple filesystem objects with a single underlying storage can
     /// cause a filesystem corruption.
+    ///
+    /// # Transaction Log (optional, requires `transaction-safe` feature)
+    ///
+    /// If you enable the transaction log via `FsOptions::with_transaction_log()`, the filesystem
+    /// will use two-phase commit for metadata writes, providing power-loss resilience.
+    ///
+    /// ```ignore
+    /// use fatrs::{FileSystem, FsOptions};
+    ///
+    /// // Enable transaction log with default configuration
+    /// let options = FsOptions::new().with_transaction_log();
+    /// let fs = FileSystem::new(disk, options).await?;
+    ///
+    /// // Or specify custom log location
+    /// let options = FsOptions::new().with_transaction_log_at(100, 8);
+    /// let fs = FileSystem::new(disk, options).await?;
+    /// ```
     ///
     /// # Errors
     ///
@@ -450,6 +558,18 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let status_flags = bpb.status_flags();
         #[cfg(feature = "fat-cache")]
         let sector_size = u32::from(bpb.bytes_per_sector);
+
+        // Extract transaction log config before moving options
+        #[cfg(feature = "transaction-safe")]
+        let transaction_log_config = {
+            let mut config = options.transaction_log_config.unwrap_or_else(TransactionLogConfig::automatic);
+            // If log_start_sector is 0, calculate automatic placement
+            if config.log_start_sector == 0 {
+                config.log_start_sector = first_data_sector.saturating_sub(4);
+            }
+            config
+        };
+
         trace!("FileSystem::new end");
 
         let fs = Self {
@@ -462,6 +582,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters,
             fs_info: Shared::new(fs_info),
             current_status_flags: AtomicU8::new(status_flags.encode()),
+            cluster_generation: AtomicU64::new(0),
             #[cfg(feature = "fat-cache")]
             fat_cache: Shared::new(crate::fat_cache::FatCache::new(sector_size)),
             #[cfg(feature = "dir-cache")]
@@ -470,10 +591,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             cluster_bitmap: Shared::new(crate::cluster_bitmap::ClusterBitmap::new(total_clusters)),
             #[cfg(feature = "transaction-safe")]
             transaction_log: Shared::new(crate::transaction::TransactionLog::new(
-                // Use reserved sectors after FAT for transaction log
-                // Typically: boot_sector(1) + FAT(N) + FAT_mirror(N) = transaction_log_start
-                first_data_sector.saturating_sub(4), // Reserve 4 sectors before data area
-                4, // 4 sectors = 2KB for transaction log (supports 4 concurrent transactions)
+                transaction_log_config.log_start_sector,
+                transaction_log_config.log_sector_count,
             )),
             #[cfg(feature = "file-locking")]
             file_locks: Shared::new(crate::file_locking::FileLockManager::new()),
@@ -679,6 +798,11 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
         let mut fs_info = self.fs_info.acquire().await;
         fs_info.map_free_clusters(|n| n + num_free);
+
+        // Increment generation counter to invalidate cached directory entry positions
+        // This prevents writing to reallocated clusters
+        self.cluster_generation.fetch_add(1, Ordering::Release);
+
         Ok(())
     }
 
@@ -804,6 +928,17 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.flush().await
     }
 
+    /// Get the current cluster generation counter.
+    ///
+    /// This counter is incremented whenever clusters are freed/deallocated.
+    /// It's used internally to detect stale directory entry positions and
+    /// prevent corruption from writing to reallocated clusters.
+    ///
+    /// This method is primarily useful for testing and debugging.
+    pub fn cluster_generation(&self) -> u64 {
+        self.cluster_generation.load(Ordering::Acquire)
+    }
+
     /// Get FAT cache statistics (hits, misses, hit rate)
     ///
     /// Only available when `fat-cache` feature is enabled.
@@ -827,95 +962,6 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.cluster_bitmap.acquire().await.statistics()
     }
 
-    /// Perform a transaction-safe metadata write operation
-    ///
-    /// This wraps a critical metadata operation with two-phase commit for power-loss resilience.
-    /// The operation is logged before execution and cleared after successful completion.
-    ///
-    /// # Arguments
-    /// * `tx_type` - Type of transaction being performed
-    /// * `affected_sectors` - List of disk sectors that will be modified
-    /// * `operation` - Async closure that performs the actual operation
-    ///
-    /// # Safety Guarantees
-    /// - If power is lost before operation completes, filesystem remains consistent
-    /// - On next mount, incomplete transactions are detected and rolled back
-    /// - Prevents corruption from partial metadata writes
-    ///
-    /// # Example
-    /// ```ignore
-    /// fs.with_transaction(
-    ///     TransactionType::FatUpdate,
-    ///     &[fat_sector],
-    ///     |disk| async move {
-    ///         // Perform FAT update
-    ///         disk.seek(SeekFrom::Start(offset)).await?;
-    ///         disk.write_u32_le(value).await?;
-    ///         Ok(())
-    ///     }
-    /// ).await?;
-    /// ```
-    #[cfg(feature = "transaction-safe")]
-    pub async fn with_transaction<F, Fut>(
-        &self,
-        tx_type: crate::transaction::TransactionType,
-        affected_sectors: &[u32],
-        operation: F,
-    ) -> Result<(), Error<IO::Error>>
-    where
-        F: FnOnce() -> Fut,
-        Fut: core::future::Future<Output = Result<(), Error<IO::Error>>>,
-    {
-        let mut tx_log = self.transaction_log.acquire().await;
-
-        // Begin transaction (allocate slot and prepare intent)
-        let slot = tx_log
-            .begin_transaction(tx_type, affected_sectors)
-            .ok_or(Error::NotEnoughSpace)?; // All transaction slots full
-
-        // Write intent to disk
-        {
-            let mut disk = self.disk.acquire().await;
-            tx_log.write_intent(&mut *disk, slot).await?;
-        }
-
-        // Mark as in progress
-        tx_log.mark_in_progress(slot);
-
-        // Perform the actual operation
-        let result = operation().await;
-
-        if result.is_ok() {
-            // Operation succeeded - commit transaction
-            let mut disk = self.disk.acquire().await;
-            tx_log.commit(&mut *disk, slot).await?;
-
-            // Clear the transaction entry
-            tx_log.clear(&mut *disk, slot).await?;
-        } else {
-            // Operation failed - clear transaction log
-            // The rollback will happen on next mount if power is lost here
-            let mut disk = self.disk.acquire().await;
-            tx_log.clear(&mut *disk, slot).await.ok(); // Best effort
-        }
-
-        result
-    }
-
-    /// Get transaction log statistics
-    ///
-    /// Returns information about transaction log usage and recovery history.
-    /// Only available when `transaction-safe` feature is enabled.
-    #[cfg(feature = "transaction-safe")]
-    pub async fn transaction_statistics(&self) -> crate::transaction::TransactionStatistics {
-        let tx_log = self.transaction_log.acquire().await;
-        crate::transaction::TransactionStatistics {
-            total_slots: 4,
-            used_slots: tx_log.get_incomplete_transactions().count(),
-            sequence_number: tx_log.sequence,
-        }
-    }
-
     /// Flushes any in memory state to the filesystem
     ///
     /// Updates the FS Information Sector if needed and clears
@@ -932,8 +978,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
         self.flush_fs_info().await?;
 
-        // TODO: Fix set_dirty_flag - it's currently corrupting the filesystem when used with buffered streams
-        // self.set_dirty_flag(false).await?;
+        // Clear dirty flag on successful unmount
+        self.set_dirty_flag(false).await.map_err(|e| Error::Io(e))?;
 
         // Flush the underlying disk to ensure all data is written
         {
@@ -1067,6 +1113,100 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP
     }
 }
 
+/// Implementation for transaction-safe operations (requires TimeProvider for timestamping)
+#[cfg(feature = "transaction-safe")]
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> FileSystem<IO, TP, OCC> {
+    /// Perform a transaction-safe metadata write operation
+    ///
+    /// This wraps a critical metadata operation with two-phase commit for power-loss resilience.
+    /// The operation is logged before execution and cleared after successful completion.
+    ///
+    /// # Arguments
+    /// * `tx_type` - Type of transaction being performed
+    /// * `affected_sectors` - List of disk sectors that will be modified
+    /// * `operation` - Async closure that performs the actual operation
+    ///
+    /// # Safety Guarantees
+    /// - If power is lost before operation completes, filesystem remains consistent
+    /// - On next mount, incomplete transactions are detected and rolled back
+    /// - Prevents corruption from partial metadata writes
+    ///
+    /// # Example
+    /// ```ignore
+    /// fs.with_transaction(
+    ///     TransactionType::FatUpdate,
+    ///     &[fat_sector],
+    ///     |disk| async move {
+    ///         // Perform FAT update
+    ///         disk.seek(SeekFrom::Start(offset)).await?;
+    ///         disk.write_u32_le(value).await?;
+    ///         Ok(())
+    ///     }
+    /// ).await?;
+    /// ```
+    pub async fn with_transaction<F, Fut>(
+        &self,
+        tx_type: crate::transaction::TransactionType,
+        affected_sectors: &[u32],
+        operation: F,
+    ) -> Result<(), Error<IO::Error>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<(), Error<IO::Error>>>,
+    {
+        let mut tx_log = self.transaction_log.acquire().await;
+
+        // Get current timestamp from TimeProvider
+        let timestamp = self.options.time_provider.get_current_date_time().to_unix_timestamp();
+
+        // Begin transaction (allocate slot and prepare intent)
+        let slot = tx_log
+            .begin_transaction(tx_type, affected_sectors, timestamp)
+            .ok_or(Error::NotEnoughSpace)?; // All transaction slots full
+
+        // Write intent to disk
+        {
+            let mut disk = self.disk.acquire().await;
+            tx_log.write_intent(&mut *disk, slot).await?;
+        }
+
+        // Mark as in progress
+        tx_log.mark_in_progress(slot);
+
+        // Perform the actual operation
+        let result = operation().await;
+
+        if result.is_ok() {
+            // Operation succeeded - commit transaction
+            let mut disk = self.disk.acquire().await;
+            tx_log.commit(&mut *disk, slot).await?;
+
+            // Clear the transaction entry
+            tx_log.clear(&mut *disk, slot).await?;
+        } else {
+            // Operation failed - clear transaction log
+            // The rollback will happen on next mount if power is lost here
+            let mut disk = self.disk.acquire().await;
+            tx_log.clear(&mut *disk, slot).await.ok(); // Best effort
+        }
+
+        result
+    }
+
+    /// Get transaction log statistics
+    ///
+    /// Returns information about transaction log usage and recovery history.
+    /// Only available when `transaction-safe` feature is enabled.
+    pub async fn transaction_statistics(&self) -> crate::transaction::TransactionStatistics {
+        let tx_log = self.transaction_log.acquire().await;
+        crate::transaction::TransactionStatistics {
+            total_slots: 4,
+            used_slots: tx_log.get_incomplete_transactions().count(),
+            sequence_number: tx_log.sequence,
+        }
+    }
+}
+
 /// `Drop` implementation tries to unmount the filesystem when dropping.
 impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
     fn drop(&mut self) {
@@ -1096,10 +1236,9 @@ impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
 impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let size = self.fs.disk.acquire().await.write(buf).await?;
-        // TODO: Fix set_dirty_flag - it's currently corrupting the filesystem when used with buffered streams
-        // if size > 0 {
-        //     self.fs.set_dirty_flag(true).await?;
-        // }
+        if size > 0 {
+            self.fs.set_dirty_flag(true).await?;
+        }
         Ok(size)
     }
 

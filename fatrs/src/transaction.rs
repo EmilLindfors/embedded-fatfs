@@ -369,10 +369,16 @@ impl TransactionLog {
     /// Begin a new transaction
     ///
     /// Returns the transaction slot index, or None if all slots are full.
+    ///
+    /// # Arguments
+    /// * `tx_type` - The type of transaction being started
+    /// * `affected_sectors` - List of sectors that will be modified (max 64)
+    /// * `timestamp` - Unix timestamp (seconds since epoch) for when transaction started
     pub fn begin_transaction(
         &mut self,
         tx_type: TransactionType,
         affected_sectors: &[u32],
+        timestamp: u64,
     ) -> Option<usize> {
         // Find an empty slot
         let slot = self
@@ -384,7 +390,7 @@ impl TransactionLog {
         entry.tx_type = tx_type;
         entry.state = TransactionState::Pending;
         entry.sequence = self.sequence;
-        entry.timestamp = 0; // TODO: Get actual timestamp from TimeProvider
+        entry.timestamp = timestamp;
         entry.sector_count = affected_sectors.len().min(64) as u16;
 
         for (i, &sector) in affected_sectors.iter().take(64).enumerate() {
@@ -518,7 +524,9 @@ mod tests {
     fn test_transaction_log_begin() {
         let mut log = TransactionLog::new(100, 10);
 
-        let slot = log.begin_transaction(TransactionType::FatUpdate, &[200, 201, 202]);
+        // Use a known timestamp (2024-01-01 00:00:00 UTC = 1704067200)
+        let timestamp = 1704067200u64;
+        let slot = log.begin_transaction(TransactionType::FatUpdate, &[200, 201, 202], timestamp);
         assert!(slot.is_some());
 
         let slot = slot.unwrap();
@@ -526,5 +534,6 @@ mod tests {
         assert_eq!(log.entries[slot].state, TransactionState::Pending);
         assert_eq!(log.entries[slot].sector_count, 3);
         assert_eq!(log.entries[slot].affected_sectors[0], 200);
+        assert_eq!(log.entries[slot].timestamp, timestamp);
     }
 }

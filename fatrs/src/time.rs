@@ -150,6 +150,66 @@ impl DateTime {
             Time::decode(dos_time, dos_time_hi_res),
         )
     }
+
+    /// Convert `DateTime` to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+    ///
+    /// Note: DOS dates start from 1980, so this will return a timestamp >= 315532800
+    /// (which is 1980-01-01 00:00:00). This conversion assumes the `DateTime` is in UTC.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)] // We ensure values are positive
+    #[allow(clippy::cast_possible_truncation)] // Year is u16, fits in i64
+    pub(crate) fn to_unix_timestamp(self) -> u64 {
+        // Days in each month (non-leap year)
+        const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        // Days from 1970-01-01 to 1980-01-01 is 3652 days (accounting for leap years: 1972, 1976)
+        const DAYS_FROM_1970_TO_1980: i64 = 3652;
+        const SECONDS_PER_DAY: i64 = 86400;
+
+        // Calculate days since 1980-01-01
+        let year = i64::from(self.date.year);
+        let month = i64::from(self.date.month);
+        let day = i64::from(self.date.day);
+
+        // Calculate days from 1980-01-01 to this date
+        let mut days_since_1980 = 0i64;
+
+        // Add full years
+        #[allow(clippy::cast_possible_truncation)] // y is i64 in valid u16 range
+        for y in 1980..year {
+            days_since_1980 += if Self::is_leap_year(y as u16) { 366 } else { 365 };
+        }
+
+        // Add full months in current year
+        #[allow(clippy::cast_possible_truncation)] // year is i64 in valid u16 range
+        #[allow(clippy::cast_sign_loss)] // m-1 is always positive
+        for m in 1..month {
+            days_since_1980 += DAYS_IN_MONTH[(m - 1) as usize];
+            // Add leap day if February and leap year
+            if m == 2 && Self::is_leap_year(year as u16) {
+                days_since_1980 += 1;
+            }
+        }
+
+        // Add days in current month (subtract 1 because day 1 is the first day, not zero days)
+        days_since_1980 += day - 1;
+
+        // Convert to seconds since 1980
+        let seconds_since_1980 = days_since_1980 * SECONDS_PER_DAY
+            + i64::from(self.time.hour) * 3600
+            + i64::from(self.time.min) * 60
+            + i64::from(self.time.sec);
+
+        // Convert to seconds since 1970
+        let seconds_since_1970 = (DAYS_FROM_1970_TO_1980 * SECONDS_PER_DAY) + seconds_since_1980;
+
+        // Safe cast: DOS dates are 1980-2107, so timestamp is always positive and < 2^63
+        seconds_since_1970 as u64
+    }
+
+    /// Check if a year is a leap year
+    fn is_leap_year(year: u16) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    }
 }
 
 #[cfg(feature = "chrono-compat")]
@@ -336,7 +396,7 @@ pub type DefaultTimeProvider = NullTimeProvider;
 
 #[cfg(test)]
 mod tests {
-    use super::{Date, DateTime, Time};
+    use super::{Date, Time};
 
     #[test]
     fn date_new_no_panic_1980() {
@@ -382,6 +442,39 @@ mod tests {
         assert_eq!(t1, Time::decode(x1, y1));
         assert_eq!(t2, Time::decode(x2, y2));
         assert_eq!(t3, Time::decode(x3, y3));
+    }
+
+    #[test]
+    fn datetime_to_unix_timestamp() {
+        use super::DateTime;
+
+        // Test 1980-01-01 00:00:00 (earliest DOS date)
+        // 1980-01-01 is 315532800 seconds since Unix epoch
+        assert_eq!(
+            DateTime::new(Date::new(1980, 1, 1), Time::new(0, 0, 0, 0)).to_unix_timestamp(),
+            315532800
+        );
+
+        // Test 2024-01-01 00:00:00
+        // 2024-01-01 00:00:00 UTC = 1704067200
+        assert_eq!(
+            DateTime::new(Date::new(2024, 1, 1), Time::new(0, 0, 0, 0)).to_unix_timestamp(),
+            1704067200
+        );
+
+        // Test 2024-06-15 12:30:45
+        // 2024-06-15 12:30:45 UTC = 1718454645
+        assert_eq!(
+            DateTime::new(Date::new(2024, 6, 15), Time::new(12, 30, 45, 0)).to_unix_timestamp(),
+            1718454645
+        );
+
+        // Test leap year handling: 2000-02-29 (leap day)
+        // 2000-02-29 00:00:00 UTC = 951782400
+        assert_eq!(
+            DateTime::new(Date::new(2000, 2, 29), Time::new(0, 0, 0, 0)).to_unix_timestamp(),
+            951782400
+        );
     }
 
     #[test]

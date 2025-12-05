@@ -52,7 +52,7 @@ macos = ["nix", "libc", "embedded-io-async", "embedded-io", "tokio", "std"]
 
 # Logging features
 logging = ["log"]
-defmt-logging = ["defmt"]
+defmt-logging = ["dep:defmt"]
 
 # std support
 std = ["embedded-io?/std", "embedded-io-async?/std"]

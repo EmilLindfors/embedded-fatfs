@@ -470,17 +470,18 @@ pub(crate) struct DirEntryEditor {
     data: DirFileEntryData,
     pos: u64,
     dirty: bool,
-    // TODO (Phase 2): Add generation counter to detect stale positions
-    // when directory clusters are reallocated. For now, immediate flushing
-    // after writes prevents the corruption scenario.
+    /// Generation counter snapshot from when this editor was created.
+    /// Used to detect if directory clusters have been reallocated.
+    generation: u64,
 }
 
 impl DirEntryEditor {
-    fn new(data: DirFileEntryData, pos: u64) -> Self {
+    fn new(data: DirFileEntryData, pos: u64, generation: u64) -> Self {
         Self {
             data,
             pos,
             dirty: false,
+            generation,
         }
     }
 
@@ -533,7 +534,7 @@ impl DirEntryEditor {
     pub(crate) async fn flush<IO: ReadWriteSeek, TP, OCC>(
         &mut self,
         fs: &FileSystem<IO, TP, OCC>,
-    ) -> Result<(), IO::Error> {
+    ) -> Result<(), Error<IO::Error>> {
         if self.dirty {
             self.write(fs).await?;
             self.dirty = false;
@@ -545,13 +546,24 @@ impl DirEntryEditor {
     async fn write<IO: ReadWriteSeek, TP, OCC>(
         &self,
         fs: &FileSystem<IO, TP, OCC>,
-    ) -> Result<(), IO::Error> {
+    ) -> Result<(), Error<IO::Error>> {
+        use core::sync::atomic::Ordering;
+
+        // Validate generation counter to prevent writing to reallocated clusters
+        let current_generation = fs.cluster_generation.load(Ordering::Acquire);
+        if current_generation != self.generation {
+            // Directory clusters have been freed/reallocated since this editor was created
+            // Writing to the cached position would corrupt data
+            error!(
+                "Stale directory entry detected: generation {} != {}",
+                self.generation, current_generation
+            );
+            return Err(Error::StaleDirectoryEntry);
+        }
+
         {
             let mut disk = fs.disk.acquire().await;
-            // NOTE: This position was cached at directory entry creation time.
-            // In Phase 2, we should add validation that the position is still valid
-            // (i.e., directory hasn't been reallocated). For now, immediate flushing
-            // after each write prevents stale position issues.
+            // Position is valid - generation hasn't changed
             disk.seek(io::SeekFrom::Start(self.pos)).await?;
             self.data.serialize(&mut *disk).await?;
         }
@@ -648,7 +660,9 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
     }
 
     fn editor(&self) -> DirEntryEditor {
-        DirEntryEditor::new(self.data.clone(), self.entry_pos)
+        use core::sync::atomic::Ordering;
+        let generation = self.fs.cluster_generation.load(Ordering::Acquire);
+        DirEntryEditor::new(self.data.clone(), self.entry_pos, generation)
     }
 
     pub(crate) fn is_same_entry(&self, other: &DirEntry<IO, TP, OCC>) -> bool {

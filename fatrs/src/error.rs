@@ -33,6 +33,10 @@ pub enum Error<T> {
     /// File is locked by another reader or writer (requires `file-locking` feature).
     #[cfg(feature = "file-locking")]
     FileLocked,
+    /// Directory entry position is stale due to cluster reallocation.
+    /// This indicates the directory containing this file/directory was modified
+    /// (entries deleted/moved) while this entry was open.
+    StaleDirectoryEntry,
 }
 
 impl<T> IoError for Error<T>
@@ -84,6 +88,7 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
             Error::CorruptedFileSystem => write!(f, "Corrupted file system"),
             #[cfg(feature = "file-locking")]
             Error::FileLocked => write!(f, "File is locked by another reader or writer"),
+            Error::StaleDirectoryEntry => write!(f, "Directory entry position is stale due to cluster reallocation"),
         }
     }
 }

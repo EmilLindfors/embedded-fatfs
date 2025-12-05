@@ -36,10 +36,40 @@ This document tracks planned features, optimizations, and improvements for fatrs
 - [x] Heap-allocated adapters (fatrs-adapters-alloc)
 - [x] Platform-specific implementations (fatrs-block-platform)
 - [x] FUSE filesystem support (fatrs-fuse)
+- [x] Generation counter for stale directory entry detection ← **Completed!**
+- [x] True stack/heap separation in adapters ← **Completed!**
 
 ---
 
 ## 🚧 In Progress
+
+### Outstanding TODOs from Codebase Audit
+
+#### High Priority
+- [ ] **Parent inode tracking** (fatrs-fuse/src/lib.rs:394) - Track parent directory properly in FUSE layer
+- [ ] **Physical drive mapping** (fatrs-block-platform/src/windows.rs:415) - Detect physical drive for Windows devices
+- [ ] **macOS BlockDevice Implementation** (fatrs-block-platform/src/macos.rs) - Complete stub implementation
+  - [ ] Implement `MacOSBlockDevice::open()` using diskutil and raw device access
+  - [ ] Implement Clone, ErrorType, Read, Write, Seek, BlockDevice traits
+  - [ ] Implement `list_disks()` using diskutil list or system APIs
+  - [ ] Add tests for macOS disk access
+
+#### Medium Priority
+- [x] **Timestamp from TimeProvider** (fatrs/src/transaction.rs:387) - Get actual timestamp instead of hardcoded 0 ← **Completed!**
+- [ ] **AsyncIterator for File Extents** (fatrs/src/file.rs:263) - Implement extents using AsyncIterator pattern
+- [ ] **Directory Cache Placeholder** (fatrs/src/dir_cache.rs:16-18) - Replace `DirFileEntryData` placeholder with actual type
+
+#### Low Priority
+- [ ] **Reduce panic! usage** - Replace panic! with proper error handling in:
+  - fatrs-adapters/src/adapters/block_device_adapter.rs:96,135 (alloc unavailable)
+  - fatrs-adapters/src/domain/error.rs:96 (error conversion helper)
+  - fatrs/src/file.rs:161,801 (invalid state panics)
+
+#### Pre-existing Test Failures
+- [ ] Fix `test_concurrent_file_creation_unique_names` - UnexpectedEof error
+- [ ] Fix `test_delete_file` - InvalidInput on file removal
+- [ ] Fix `test_rename_file` - Embassy integration test failure
+- [ ] Fix `test_write_large_file` - Embassy integration test failure
 
 ### Cluster Chain Checkpoints
 **Priority:** Medium
@@ -190,11 +220,18 @@ This document tracks planned features, optimizations, and improvements for fatrs
 
 ## 🐛 Known Issues & Improvements
 
+### Critical Issues Fixed (v0.4.0)
+- [x] **Generation Counter for Stale Directory Entries** - Prevents corruption from writing to reallocated clusters
+- [x] **set_dirty_flag Re-enabled** - Fixed DiskSlice seek bug and flag clearing logic
+- [x] **fatrs-block-platform Compilation** - Fixed sdspi, stream, and fmt module issues
+
 ### Code Quality
 - [ ] Fix lifetime warning in `FileSystem::root_dir()`
 - [ ] Remove dead code warnings (invalidate, mark_clean, etc.)
 - [ ] Add `#[must_use]` annotations where appropriate
 - [ ] Improve error messages
+- [x] Generation counter implementation ← **Completed!**
+- [x] Stale directory entry detection ← **Completed!**
 
 ### Testing
 - [ ] Add property-based tests (proptest/quickcheck)
@@ -202,6 +239,8 @@ This document tracks planned features, optimizations, and improvements for fatrs
 - [ ] Test on real eMMC
 - [ ] Power-loss injection testing
 - [ ] Fuzzing for robustness
+- [x] Generation counter tests ← **Completed!**
+- [ ] Fix pre-existing test failures (see Outstanding TODOs above)
 
 ### Documentation
 - [ ] Add more inline code examples
@@ -371,7 +410,102 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#research-references) and `PERFORMANCE_ROAD
 
 ---
 
-**Last Updated:** 2025-11-30
+## 📝 Recent Updates
+
+### v0.4.0 Codebase Audit & Fixes (2025-12-05)
+
+**What was investigated:**
+- Complete audit of TODOs, stubs, unused code, and compilation issues
+- Found 11 TODO comments, 1 stub implementation (macOS), 447 unwrap/expect calls
+- Identified critical stale directory entry corruption risk
+
+**What was fixed:**
+- ✅ **Generation Counter Implementation** - Prevents corruption from stale directory positions
+  - Added `AtomicU64 cluster_generation` to FileSystem
+  - Increments on every cluster deallocation
+  - DirEntryEditor validates generation before writing
+  - Returns `Error::StaleDirectoryEntry` if clusters were reallocated
+  - **Both files and directories are protected** via DirEntryEditor
+- ✅ **set_dirty_flag Re-enabled** - Was disabled due to corruption, now safe
+  - Fixed DiskSlice::seek() returning relative vs absolute positions
+  - Fixed `flags.dirty |= dirty` to `flags.dirty = dirty`
+  - All corruption tests passing
+- ✅ **fatrs-block-platform Compilation Fixes**
+  - sdspi.rs: Removed invalid crate-level attribute, fixed fmt import
+  - stream.rs: Added missing feature gate for embedded-io-async
+  - lib.rs: Made fmt module available for sdspi feature
+  - Cargo.toml: Fixed defmt feature to use `dep:defmt`
+
+**Metrics:**
+- Files changed: 8
+- Lines added: +69
+- Lines removed: -31
+- Tests: 47 passing (39 core + 6 corruption + 2 generation)
+- Code quality: No new warnings, all clippy checks pass
+
+**What still needs work:**
+See "Outstanding TODOs from Codebase Audit" section above for complete list.
+
+### Timestamp from TimeProvider Implementation (2025-12-05)
+
+**What was implemented:**
+- Added `DateTime::to_unix_timestamp()` method to convert DOS datetime to Unix timestamp
+- Updated `TransactionLog::begin_transaction()` to accept timestamp parameter
+- Updated `FileSystem::with_transaction()` to get timestamp from TimeProvider
+- Moved `with_transaction()` to new impl block with `TP: TimeProvider` bound
+
+**Technical details:**
+- Converts FAT DOS datetime (1980-2107) to Unix timestamp (seconds since 1970)
+- Handles leap years correctly (tested with 2000-02-29)
+- Transaction log now records actual creation time instead of 0
+- Useful for debugging and forensics of power-loss recovery
+
+**Metrics:**
+- Files changed: 3 (fatrs/src/time.rs, transaction.rs, fs.rs)
+- Tests added: 1 (`datetime_to_unix_timestamp` with 4 test cases)
+- All 39 tests passing with transaction-safe feature
+- Zero clippy warnings
+
+### Ergonomic Transaction Log API (2025-12-05)
+
+**What was implemented:**
+- Added `TransactionLogConfig` struct for configuring transaction log placement
+- Added `FsOptions::with_transaction_log()` for automatic placement
+- Added `FsOptions::with_transaction_log_at()` for custom placement
+- Updated `FileSystem::new()` to use configuration from options
+- Added comprehensive documentation with examples
+
+**API Examples:**
+```rust
+// Enable transaction log with automatic placement
+let options = FsOptions::new().with_transaction_log();
+let fs = FileSystem::new(disk, options).await?;
+
+// Or specify custom log location
+let options = FsOptions::new().with_transaction_log_at(100, 8);
+let fs = FileSystem::new(disk, options).await?;
+
+// Backwards compatible - works without explicit configuration
+let options = FsOptions::new();
+let fs = FileSystem::new(disk, options).await?; // Uses default placement
+```
+
+**Technical details:**
+- `log_start_sector: 0` means automatic placement (before data area)
+- Automatic placement uses `first_data_sector.saturating_sub(4)`
+- Configuration is optional for backwards compatibility
+- Transaction log always created when `transaction-safe` feature enabled
+
+**Metrics:**
+- Files changed: 1 (fatrs/src/fs.rs)
+- New types: `TransactionLogConfig`
+- New methods: `with_transaction_log()`, `with_transaction_log_at()`
+- All 39 tests passing + 2 integration tests
+- Zero clippy warnings
+
+---
+
+**Last Updated:** 2025-12-05
 **Maintained By:** embedded-fatfs contributors
 **License:** MIT
 

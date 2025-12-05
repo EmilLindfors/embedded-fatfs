@@ -1,7 +1,5 @@
 //! A crate for interfacing with SD cards over SPI.
 
-#![no_std]
-
 use aligned::Aligned;
 use core::fmt::Debug;
 use core::future::Future;
@@ -29,9 +27,6 @@ const SD_CRC7: Crc<u8, NoTable> = Crc::<u8, NoTable>::new(&CRC7_SD);
 
 /// CRC-16 X25 calculator for SD card data blocks (minimal memory footprint).
 const SD_CRC16: Crc<u16, NoTable> = Crc::<u16, NoTable>::new(&CRC_16_IBM_SDLC);
-
-// MUST be the first module listed
-mod fmt;
 
 /// Status for card in the ready state
 pub const R1_READY_STATE: u8 = 0x00;

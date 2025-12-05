@@ -49,11 +49,19 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 
+// Logging support - needed by sdspi and when defmt-logging is enabled
+// Must be declared early so macros are available to other modules
+#[cfg_attr(any(feature = "defmt-logging", feature = "sdspi"), macro_use)]
+#[cfg(any(feature = "defmt-logging", feature = "sdspi"))]
+mod fmt;
+
 // Re-export core types
 pub use fatrs_block_device::{BlockDevice, SendBlockDevice};
 
-// Generic stream adapter (always available)
+// Generic stream adapter (requires embedded-io-async)
+#[cfg(feature = "embedded-io-async")]
 pub mod stream;
+#[cfg(feature = "embedded-io-async")]
 pub use stream::StreamBlockDevice;
 
 // Embedded SPI module
@@ -79,7 +87,3 @@ pub use linux::{BlockDeviceInfo, LinuxBlockDevice, list_block_devices};
 pub mod macos;
 #[cfg(all(target_os = "macos", feature = "macos"))]
 pub use macos::{DiskInfo, MacOSBlockDevice, list_disks};
-
-// Logging support
-#[cfg(feature = "defmt-logging")]
-pub(crate) mod fmt;

@@ -1,4 +1,3 @@
-#![macro_use]
 #![allow(unused_macros)]
 
 #[cfg(all(feature = "defmt", feature = "log"))]
