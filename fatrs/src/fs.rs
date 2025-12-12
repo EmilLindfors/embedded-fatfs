@@ -29,6 +29,23 @@ use crate::table::{
 };
 use crate::time::{DefaultTimeProvider, TimeProvider};
 
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::vec::Vec;
+#[cfg(all(feature = "alloc", feature = "std"))]
+use std::vec::Vec;
+
+/// Tracks a dirty directory entry that needs to be flushed before reading.
+///
+/// This is used to prevent directory entry cache corruption when multiple
+/// files are created/modified in the same directory without explicit flushes.
+#[derive(Clone)]
+pub(crate) struct DirtyDirEntry {
+    /// Position of the directory entry on disk
+    pub pos: u64,
+    /// The entry data to be written
+    pub data: DirFileEntryData,
+}
+
 // FAT implementation based on:
 //   http://wiki.osdev.org/FAT
 //   https://www.win.tue.nl/~aeb/linux/fs/fat/fat-1.html
@@ -466,6 +483,11 @@ where
     /// Generation counter incremented on cluster deallocation
     /// Used to detect stale directory entry positions
     pub(crate) cluster_generation: AtomicU64,
+    /// Registry of dirty directory entries awaiting flush.
+    /// Used to prevent directory entry cache corruption when multiple
+    /// files are created/modified in the same directory.
+    #[cfg(feature = "alloc")]
+    pub(crate) dirty_dir_entries: Shared<Vec<DirtyDirEntry>>,
     #[cfg(feature = "fat-cache")]
     pub(crate) fat_cache: Shared<crate::fat_cache::FatCache>,
     #[cfg(feature = "dir-cache")]
@@ -640,6 +662,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             fs_info: Shared::new(fs_info),
             current_status_flags: AtomicU8::new(status_flags.encode()),
             cluster_generation: AtomicU64::new(0),
+            #[cfg(feature = "alloc")]
+            dirty_dir_entries: Shared::new(Vec::new()),
             #[cfg(feature = "fat-cache")]
             fat_cache: Shared::new(crate::fat_cache::FatCache::new(sector_size)),
             #[cfg(feature = "dir-cache")]
@@ -1036,18 +1060,86 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.cluster_bitmap.acquire().await.statistics()
     }
 
+    /// Registers a dirty directory entry that needs to be flushed.
+    ///
+    /// This is called when a DirEntryEditor is modified (e.g., file size changes).
+    #[cfg(feature = "alloc")]
+    pub(crate) async fn register_dirty_dir_entry(&self, pos: u64, data: DirFileEntryData) {
+        let mut guard = self.dirty_dir_entries.acquire().await;
+        // Update existing entry at this position or add new one
+        if let Some(existing) = guard.iter_mut().find(|e| e.pos == pos) {
+            existing.data = data;
+        } else {
+            guard.push(DirtyDirEntry { pos, data });
+        }
+    }
+
+    /// Removes a dirty directory entry from the registry.
+    ///
+    /// This is called after a DirEntryEditor has been successfully flushed.
+    #[cfg(feature = "alloc")]
+    pub(crate) async fn unregister_dirty_dir_entry(&self, pos: u64) {
+        let mut guard = self.dirty_dir_entries.acquire().await;
+        guard.retain(|e| e.pos != pos);
+    }
+
+    /// Flushes all dirty directory entries to disk.
+    ///
+    /// This should be called before reading directory sectors to ensure
+    /// consistency when multiple files are being created/modified in the
+    /// same directory.
+    #[cfg(feature = "alloc")]
+    pub(crate) async fn flush_dirty_dir_entries(&self) -> Result<(), Error<IO::Error>> {
+        // Get a copy of dirty entries to avoid holding the lock while writing
+        let entries: Vec<DirtyDirEntry> = {
+            let guard = self.dirty_dir_entries.acquire().await;
+            guard.clone()
+        };
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Write each dirty entry to disk
+        {
+            let mut disk = self.disk.acquire().await;
+            for entry in &entries {
+                disk.seek(io::SeekFrom::Start(entry.pos)).await?;
+                entry.data.serialize(&mut *disk).await?;
+            }
+            disk.flush().await?;
+        }
+
+        // Clear the dirty list
+        {
+            let mut guard = self.dirty_dir_entries.acquire().await;
+            // Only remove entries that were flushed (in case new ones were added)
+            guard.retain(|e| !entries.iter().any(|flushed| flushed.pos == e.pos));
+        }
+
+        Ok(())
+    }
+
     /// Flushes any in memory state to the filesystem
     ///
     /// Updates the FS Information Sector if needed and clears
     /// the dirty flag.
     #[allow(clippy::missing_errors_doc)]
     pub async fn flush(&self) -> Result<(), Error<IO::Error>> {
+        // Flush any dirty directory entries first
+        #[cfg(feature = "alloc")]
+        self.flush_dirty_dir_entries().await?;
+
         // Flush FAT cache if enabled
+        // CRITICAL: Must use DiskSlice (via fat_slice helper), not raw disk!
+        // The cache stores RELATIVE offsets within the FAT region, so we need
+        // DiskSlice to translate them to absolute disk positions.
         #[cfg(feature = "fat-cache")]
         {
             let mut cache = self.fat_cache.acquire().await;
-            let mut disk = self.disk.acquire().await;
-            cache.flush(&mut *disk).await?;
+            let io = FsIoAdapter { fs: self };
+            let mut disk_slice = fat_slice(io, &self.bpb);
+            cache.flush(&mut disk_slice).await?;
         }
 
         self.flush_fs_info().await?;
@@ -1536,8 +1628,9 @@ impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
         // Write data
         let storage = self.inner.borrow_mut();
         for i in 0..self.mirrors {
+            let abs_pos = offset + u64::from(i) * self.size;
             storage
-                .seek(SeekFrom::Start(offset + u64::from(i) * self.size))
+                .seek(SeekFrom::Start(abs_pos))
                 .await?;
             storage.write_all(&buf[..write_size]).await?;
         }

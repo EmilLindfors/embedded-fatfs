@@ -530,7 +530,7 @@ mod tests {
         type Error = std::io::Error;
 
         async fn read_blocks(
-            &mut self,
+            &self,
             start: crate::domain::value_objects::BlockAddress,
             dest: &mut [u8],
         ) -> Result<(), Self::Error> {
@@ -575,7 +575,7 @@ mod tests {
             Ok(())
         }
 
-        async fn size(&mut self) -> Result<u64, Self::Error> {
+        async fn size(&self) -> Result<u64, Self::Error> {
             Ok(1024 * 1024) // 1MB
         }
     }

@@ -29,7 +29,8 @@ pub const FAT_CACHE_SECTORS: usize = 8; // 4KB at 512 bytes/sector (default)
 /// A single cached FAT sector
 #[derive(Debug)]
 struct CachedFatSector {
-    /// Absolute byte offset of this sector in the FAT region
+    /// Relative byte offset of this sector within the FAT region
+    /// (NOT absolute disk offset - this is critical for correct writeback!)
     offset: u64,
     /// The sector data (max 4KB for exFAT, typically 512B for FAT32)
     data: [u8; 4096],
@@ -75,12 +76,12 @@ impl FatCache {
         (offset / u64::from(self.sector_size)) * u64::from(self.sector_size)
     }
 
-    /// Find a cached sector by absolute offset
+    /// Find a cached sector by relative offset within the FAT region
     ///
-    /// Note: This now expects absolute offsets, not relative ones!
-    /// The sector.offset is now the absolute disk offset returned by seek().
-    fn find_sector(&mut self, absolute_offset: u64) -> Option<usize> {
-        let sector_offset = self.sector_offset(absolute_offset);
+    /// The sector.offset stores the relative (sector-aligned) offset, which
+    /// matches what we pass to DiskSlice::seek() for correct writeback.
+    fn find_sector(&mut self, relative_offset: u64) -> Option<usize> {
+        let sector_offset = self.sector_offset(relative_offset);
         for (idx, slot) in self.sectors.iter().enumerate() {
             if let Some(sector) = slot {
                 if sector.offset == sector_offset {
@@ -122,15 +123,12 @@ impl FatCache {
         S: Read + Write + Seek + IoBase,
         Error<E>: From<S::Error>,
     {
+        // Calculate the relative sector-aligned offset
         let sector_offset = self.sector_offset(offset);
+        let offset_in_sector = (offset - sector_offset) as usize;
 
-        // Seek first to get the absolute offset (for DiskSlice compatibility)
-        let absolute_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
-        let absolute_sector_offset = self.sector_offset(absolute_offset);
-        let offset_in_sector = (absolute_offset - absolute_sector_offset) as usize;
-
-        // Check cache using absolute offset
-        if let Some(idx) = self.find_sector(absolute_offset) {
+        // Check cache using RELATIVE offset (this is what we store!)
+        if let Some(idx) = self.find_sector(offset) {
             // Cache hit!
             self.hits += 1;
             let sector = self.sectors[idx].as_mut().unwrap();
@@ -150,6 +148,7 @@ impl FatCache {
         let slot_idx = self.find_lru_slot();
 
         // Writeback dirty sector if needed
+        // CRITICAL: old_sector.offset is RELATIVE, which is exactly what DiskSlice::seek expects!
         if let Some(old_sector) = &self.sectors[slot_idx] {
             if old_sector.dirty {
                 storage.seek(SeekFrom::Start(old_sector.offset)).await?;
@@ -167,17 +166,18 @@ impl FatCache {
         }
 
         // Re-seek to the sector we want to read (may have changed during writeback)
-        let actual_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
+        // Pass RELATIVE offset to DiskSlice::seek
+        storage.seek(SeekFrom::Start(sector_offset)).await?;
         let mut sector_data = [0u8; 4096];
         let bytes_read = storage
             .read(&mut sector_data[..self.sector_size as usize])
             .await?;
 
-        // Cache the sector with the ACTUAL absolute offset from the seek
-        // This is critical for DiskSlice which translates relative to absolute offsets
+        // Cache the sector with RELATIVE offset (what we pass to seek, not what seek returns!)
+        // This ensures writeback uses the same offset that works correctly with DiskSlice
         self.access_counter = self.access_counter.wrapping_add(1);
         self.sectors[slot_idx] = Some(CachedFatSector {
-            offset: actual_offset,
+            offset: sector_offset,  // Store RELATIVE offset!
             data: sector_data,
             valid_len: bytes_read,
             dirty: false,
@@ -202,15 +202,12 @@ impl FatCache {
         S: Read + Write + Seek + IoBase,
         Error<E>: From<S::Error>,
     {
+        // Calculate the relative sector-aligned offset
         let sector_offset = self.sector_offset(offset);
+        let offset_in_sector = (offset - sector_offset) as usize;
 
-        // Seek first to get the absolute offset (for DiskSlice compatibility)
-        let absolute_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
-        let absolute_sector_offset = self.sector_offset(absolute_offset);
-        let offset_in_sector = (absolute_offset - absolute_sector_offset) as usize;
-
-        // Check if sector is in cache using absolute offset
-        let slot_idx = if let Some(idx) = self.find_sector(absolute_offset) {
+        // Check if sector is in cache using RELATIVE offset
+        let slot_idx = if let Some(idx) = self.find_sector(offset) {
             self.hits += 1;
             idx
         } else {
@@ -219,6 +216,7 @@ impl FatCache {
             let slot_idx = self.find_lru_slot();
 
             // Writeback old sector if dirty
+            // CRITICAL: old_sector.offset is RELATIVE, which is exactly what DiskSlice::seek expects!
             if let Some(old_sector) = &self.sectors[slot_idx] {
                 if old_sector.dirty {
                     storage.seek(SeekFrom::Start(old_sector.offset)).await?;
@@ -236,7 +234,8 @@ impl FatCache {
             }
 
             // Re-seek and read existing sector (for partial writes)
-            let actual_offset = storage.seek(SeekFrom::Start(sector_offset)).await?;
+            // Pass RELATIVE offset to DiskSlice::seek
+            storage.seek(SeekFrom::Start(sector_offset)).await?;
             let mut sector_data = [0u8; 4096];
             let bytes_read = storage
                 .read(&mut sector_data[..self.sector_size as usize])
@@ -244,7 +243,7 @@ impl FatCache {
 
             self.access_counter = self.access_counter.wrapping_add(1);
             self.sectors[slot_idx] = Some(CachedFatSector {
-                offset: actual_offset,
+                offset: sector_offset,  // Store RELATIVE offset!
                 data: sector_data,
                 valid_len: bytes_read,
                 dirty: false,

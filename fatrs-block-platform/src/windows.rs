@@ -291,17 +291,36 @@ impl BlockDevice<BLOCK_SIZE> for AsyncWindowsDevice {
     type Align = A4;
 
     async fn read(
-        &mut self,
+        &self,
         block_address: u32,
         data: &mut [Aligned<Self::Align, [u8; BLOCK_SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.seek(SeekFrom::Start((block_address as u64) * BLOCK_SIZE as u64))
-            .await?;
+        let inner = self.inner.clone();
+        let position = self.position.clone();
+        let block_offset = (block_address as u64) * BLOCK_SIZE as u64;
+        let total_len = data.len() * BLOCK_SIZE;
 
-        for block in data {
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::{Read as _, Seek as _};
+            let mut file = inner.lock().unwrap();
+
+            // Seek to block position
+            file.seek(std::io::SeekFrom::Start(block_offset))?;
+
+            // Read all blocks into a temporary buffer
+            let mut temp_buf = vec![0u8; total_len];
             let mut offset = 0;
-            while offset < BLOCK_SIZE {
-                let n = Read::read(self, &mut block[offset..]).await?;
+            while offset < total_len {
+                let n = file.read(&mut temp_buf[offset..]).map_err(|e| {
+                    // Error 483 means the device is locked by Windows
+                    if e.raw_os_error() == Some(483) {
+                        io::Error::other(
+                            "Device is locked by Windows. Make sure you're running as Administrator.",
+                        )
+                    } else {
+                        e
+                    }
+                })?;
                 if n == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -310,6 +329,19 @@ impl BlockDevice<BLOCK_SIZE> for AsyncWindowsDevice {
                 }
                 offset += n;
             }
+
+            // Update position
+            *position.lock().unwrap() = block_offset + total_len as u64;
+
+            Ok::<Vec<u8>, io::Error>(temp_buf)
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        // Copy result into aligned blocks
+        for (i, block) in data.iter_mut().enumerate() {
+            let start = i * BLOCK_SIZE;
+            block.copy_from_slice(&result[start..start + BLOCK_SIZE]);
         }
         Ok(())
     }
@@ -319,24 +351,47 @@ impl BlockDevice<BLOCK_SIZE> for AsyncWindowsDevice {
         block_address: u32,
         data: &[Aligned<Self::Align, [u8; BLOCK_SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.seek(SeekFrom::Start((block_address as u64) * BLOCK_SIZE as u64))
-            .await?;
+        let inner = self.inner.clone();
+        let block_offset = (block_address as u64) * BLOCK_SIZE as u64;
 
-        for block in data {
+        // Flatten aligned blocks into a Vec
+        let write_data: Vec<u8> = data.iter().flat_map(|block| block.iter().copied()).collect();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Seek as _, Write as _};
+            let mut file = inner.lock().unwrap();
+
+            file.seek(std::io::SeekFrom::Start(block_offset))?;
+
             let mut offset = 0;
-            while offset < BLOCK_SIZE {
-                let n = Write::write(self, &block[offset..]).await?;
+            while offset < write_data.len() {
+                let n = file.write(&write_data[offset..])?;
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::WriteZero, "Write returned 0"));
                 }
                 offset += n;
             }
-        }
+            Ok::<(), io::Error>(())
+        })
+        .await
+        .map_err(io::Error::other)??;
+
         Ok(())
     }
 
-    async fn size(&mut self) -> Result<u64, Self::Error> {
+    async fn size(&self) -> Result<u64, Self::Error> {
         Ok(AsyncWindowsDevice::size(self))
+    }
+
+    async fn sync(&mut self) -> Result<(), Self::Error> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let file = inner.lock().unwrap();
+            file.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 }
 

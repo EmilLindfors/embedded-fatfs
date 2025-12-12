@@ -22,7 +22,7 @@
 //!     type Error = std::io::Error;
 //!     type Align = A4;
 //!
-//!     async fn read(&mut self, block: u32, data: &mut [Aligned<A4, [u8; 512]>]) -> Result<(), Self::Error> {
+//!     async fn read(&self, block: u32, data: &mut [Aligned<A4, [u8; 512]>]) -> Result<(), Self::Error> {
 //!         // Read implementation
 //!         Ok(())
 //!     }
@@ -32,8 +32,13 @@
 //!         Ok(())
 //!     }
 //!
-//!     async fn size(&mut self) -> Result<u64, Self::Error> {
+//!     async fn size(&self) -> Result<u64, Self::Error> {
 //!         Ok(1024 * 1024) // 1MB device
+//!     }
+//!
+//!     async fn sync(&mut self) -> Result<(), Self::Error> {
+//!         // Sync implementation (flush writes to storage)
+//!         Ok(())
 //!     }
 //! }
 //! ```
@@ -80,8 +85,11 @@ pub trait BlockDevice<const SIZE: usize> {
     type Align: aligned::Alignment;
 
     /// Read one or more blocks at the given block address.
+    ///
+    /// Takes `&self` since reads don't mutate the logical state of the device.
+    /// Implementations should use interior mutability if needed for hardware access.
     async fn read(
-        &mut self,
+        &self,
         block_address: u32,
         data: &mut [Aligned<Self::Align, [u8; SIZE]>],
     ) -> Result<(), Self::Error>;
@@ -94,7 +102,15 @@ pub trait BlockDevice<const SIZE: usize> {
     ) -> Result<(), Self::Error>;
 
     /// Report the size of the block device in bytes.
-    async fn size(&mut self) -> Result<u64, Self::Error>;
+    ///
+    /// Takes `&self` since querying the size doesn't mutate state.
+    async fn size(&self) -> Result<u64, Self::Error>;
+
+    /// Ensure all previous writes are durable.
+    ///
+    /// This operation flushes any cached writes to the underlying storage medium.
+    /// Implementations should override this if the device has write caching.
+    async fn sync(&mut self) -> Result<(), Self::Error>;
 }
 
 /// Cast a byte slice to an aligned slice of blocks.

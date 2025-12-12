@@ -22,7 +22,9 @@
       "Bash(../target/debug/fatrs.exe cat test.img:copied_file.txt)",
       "Bash(../target/debug/fatrs.exe rm test.img:copied_file.txt)",
       "Bash(../target/debug/fatrs.exe mkdir test.img:testdir)",
-      "Bash(env RUST_LOG=fatrs=trace ../target/debug/fatrs.exe rm test.img:testfile.txt)"
+      "Bash(env RUST_LOG=fatrs=trace ../target/debug/fatrs.exe rm test.img:testfile.txt)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

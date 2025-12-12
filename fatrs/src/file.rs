@@ -190,15 +190,24 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         if let Some(current_cluster) = self.context.current_cluster {
             // current cluster is none only if offset is 0
             debug_assert!(self.context.offset > 0);
-            self.fs.truncate_cluster_chain(current_cluster).await
+            self.fs.truncate_cluster_chain(current_cluster).await?;
         } else {
             debug_assert!(self.context.offset == 0);
             if let Some(n) = self.context.first_cluster {
                 self.fs.free_cluster_chain(n).await?;
                 self.context.first_cluster = None;
             }
-            Ok(())
         }
+
+        // Refresh generation counter after freeing clusters.
+        // The free_cluster_chain/truncate_cluster_chain operations increment the
+        // filesystem's generation counter, but our DirEntryEditor still has the old
+        // value. Without refreshing, subsequent flush() calls would fail with
+        // StaleDirectoryEntry even though our directory entry position is still valid.
+        if let Some(ref mut e) = self.context.entry {
+            e.refresh_generation(self.fs);
+        }
+        Ok(())
     }
 
     /// Phase 3 Optimization: Find the closest checkpoint to the target cluster index
@@ -398,8 +407,12 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
         if let Some(ref mut e) = self.context.entry {
             let now = self.fs.options.time_provider.get_current_date_time();
             e.set_modified(now);
-            if e.inner().size().is_some_and(|s| offset > s) {
+            let current_size = e.inner().size();
+            if current_size.is_some_and(|s| offset > s) {
+                trace!("update_dir_entry: offset={}, current_size={:?}, setting new size", offset, current_size);
                 e.set_size(offset);
+            } else {
+                trace!("update_dir_entry: offset={}, current_size={:?}, NOT updating size", offset, current_size);
             }
             // CRITICAL FIX: Flush directory entry immediately after updating size
             // This prevents data corruption when multiple files are written

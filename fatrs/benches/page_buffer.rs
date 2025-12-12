@@ -3,6 +3,7 @@
 ///! Measures the throughput of different page buffer sizes for I/O operations.
 ///! This benchmark compares various page sizes (4KB to 1MB) to help determine
 ///! optimal buffer sizes for different storage types (HDD, SSD, NVMe).
+use std::cell::RefCell;
 use std::time::Instant;
 use tokio::fs;
 
@@ -13,8 +14,14 @@ use fatrs_block_device::BlockDevice;
 
 const BLOCK_SIZE: usize = 512;
 
-/// Test block device wrapping a file
-struct FileBlockDevice<T>(T);
+/// Test block device wrapping a file with interior mutability
+struct FileBlockDevice<T>(RefCell<T>);
+
+impl<T> FileBlockDevice<T> {
+    fn new(inner: T) -> Self {
+        Self(RefCell::new(inner))
+    }
+}
 
 impl<T: ErrorType> ErrorType for FileBlockDevice<T> {
     type Error = T::Error;
@@ -28,11 +35,12 @@ where
     type Align = A4;
 
     async fn read(
-        &mut self,
+        &self,
         block_address: u32,
         data: &mut [Aligned<Self::Align, [u8; BLOCK_SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.0
+        let mut inner = self.0.borrow_mut();
+        inner
             .seek(SeekFrom::Start((block_address as u64) * BLOCK_SIZE as u64))
             .await?;
 
@@ -43,7 +51,7 @@ where
 
         let mut offset = 0;
         while offset < total_bytes {
-            let n = self.0.read(&mut buf[offset..]).await?;
+            let n = inner.read(&mut buf[offset..]).await?;
             if n == 0 {
                 break;
             }
@@ -57,7 +65,8 @@ where
         block_address: u32,
         data: &[Aligned<Self::Align, [u8; BLOCK_SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.0
+        let mut inner = self.0.borrow_mut();
+        inner
             .seek(SeekFrom::Start((block_address as u64) * BLOCK_SIZE as u64))
             .await?;
 
@@ -68,7 +77,7 @@ where
 
         let mut offset = 0;
         while offset < total_bytes {
-            let n = self.0.write(&buf[offset..]).await?;
+            let n = inner.write(&buf[offset..]).await?;
             if n == 0 {
                 break;
             }
@@ -77,10 +86,16 @@ where
         Ok(())
     }
 
-    async fn size(&mut self) -> Result<u64, Self::Error> {
-        let size = self.0.seek(SeekFrom::End(0)).await?;
-        self.0.seek(SeekFrom::Start(0)).await?;
+    async fn size(&self) -> Result<u64, Self::Error> {
+        let mut inner = self.0.borrow_mut();
+        let size = inner.seek(SeekFrom::End(0)).await?;
+        inner.seek(SeekFrom::Start(0)).await?;
         Ok(size)
+    }
+
+    async fn sync(&mut self) -> Result<(), Self::Error> {
+        let mut inner = self.0.borrow_mut();
+        inner.flush().await
     }
 }
 
@@ -218,7 +233,7 @@ async fn benchmark_sequential_write(name: &str, page_size: usize, data_mb: usize
     file.set_len((data_mb * 1024 * 1024) as u64).await.unwrap();
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-    let block_dev = FileBlockDevice(io);
+    let block_dev = FileBlockDevice::new(io);
     let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     let chunk = vec![0xAAu8; 64 * 1024]; // 64KB write chunks
@@ -261,7 +276,7 @@ async fn benchmark_sequential_read(name: &str, page_size: usize, data_mb: usize)
     // Write test data first
     {
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-        let block_dev = FileBlockDevice(io);
+        let block_dev = FileBlockDevice::new(io);
         let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
         let chunk = vec![0xBBu8; 64 * 1024];
@@ -281,7 +296,7 @@ async fn benchmark_sequential_read(name: &str, page_size: usize, data_mb: usize)
         .unwrap();
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-    let block_dev = FileBlockDevice(io);
+    let block_dev = FileBlockDevice::new(io);
     let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     let mut buf = vec![0u8; 64 * 1024]; // 64KB read chunks
@@ -326,7 +341,7 @@ async fn benchmark_random_access(name: &str, page_size: usize, num_accesses: usi
     file.set_len(file_size).await.unwrap();
 
     let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-    let block_dev = FileBlockDevice(io);
+    let block_dev = FileBlockDevice::new(io);
     let mut stream = LargePageStream::new_unwrap(block_dev, page_size);
 
     // Generate deterministic "random" offsets
@@ -384,7 +399,7 @@ async fn benchmark_stack_page_stream() {
         file.set_len((data_mb * 1024 * 1024) as u64).await.unwrap();
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-        let block_dev = FileBlockDevice(io);
+        let block_dev = FileBlockDevice::new(io);
         let mut stream: PageStream<_, 8> = PageStream::new(block_dev); // 8 * 512 = 4KB
 
         let chunk = vec![0xCCu8; 64 * 1024];
@@ -425,7 +440,7 @@ async fn benchmark_stack_page_stream() {
         file.set_len((data_mb * 1024 * 1024) as u64).await.unwrap();
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-        let block_dev = FileBlockDevice(io);
+        let block_dev = FileBlockDevice::new(io);
         let mut stream: PageStream<_, 16> = PageStream::new(block_dev); // 16 * 512 = 8KB
 
         let chunk = vec![0xCCu8; 64 * 1024];
@@ -466,7 +481,7 @@ async fn benchmark_stack_page_stream() {
         file.set_len((data_mb * 1024 * 1024) as u64).await.unwrap();
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-        let block_dev = FileBlockDevice(io);
+        let block_dev = FileBlockDevice::new(io);
         let mut stream = LargePageStream::new_unwrap(block_dev, presets::PAGE_4K);
 
         let chunk = vec![0xCCu8; 64 * 1024];
@@ -507,7 +522,7 @@ async fn benchmark_stack_page_stream() {
         file.set_len((data_mb * 1024 * 1024) as u64).await.unwrap();
 
         let io = embedded_io_adapters::tokio_1::FromTokio::new(file);
-        let block_dev = FileBlockDevice(io);
+        let block_dev = FileBlockDevice::new(io);
         let mut stream = LargePageStream::new_unwrap(block_dev, presets::PAGE_128K);
 
         let chunk = vec![0xCCu8; 64 * 1024];

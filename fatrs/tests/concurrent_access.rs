@@ -426,12 +426,20 @@ async fn test_concurrent_file_creation_unique_names() {
 
                     let root = fs.root_dir();
                     let filename = format!("concurrent{}.bin", i);
+                    eprintln!("[{}] Creating file {}", i, filename);
                     let mut file = root.create_file(&filename).await.unwrap();
+                    eprintln!("[{}] File created, writing 1024 bytes", i);
 
                     // Write unique content
                     let data = vec![i as u8; 1024];
                     file.write_all(&data).await.unwrap();
+                    eprintln!("[{}] write_all complete", i);
                     file.flush().await.unwrap();
+                    eprintln!("[{}] flush complete", i);
+
+                    // Check size immediately after write
+                    let size_after_write = file.seek(SeekFrom::End(0)).await.unwrap();
+                    eprintln!("[{}] Size after write: {}", i, size_after_write);
 
                     i
                 }));
@@ -446,14 +454,46 @@ async fn test_concurrent_file_creation_unique_names() {
             // All 8 tasks should succeed
             assert_eq!(results.len(), 8);
 
+            // Flush filesystem before verification
+            eprintln!("Flushing filesystem...");
+            fs.flush().await.unwrap();
+            eprintln!("Filesystem flushed.");
+
             // Verify all files exist with correct content
             let root = fs.root_dir();
+            let mut issues = Vec::new();
             for i in 0..8 {
                 let filename = format!("concurrent{}.bin", i);
-                let mut file = root.open_file(&filename).await.unwrap();
-                let mut buf = vec![0u8; 1024];
-                file.read_exact(&mut buf).await.unwrap();
-                assert!(buf.iter().all(|&b| b == i as u8));
+                let result = root.open_file(&filename).await;
+                match result {
+                    Ok(mut file) => {
+                        // First check file size by seeking to end
+                        let size = file.seek(SeekFrom::End(0)).await.unwrap();
+                        file.seek(SeekFrom::Start(0)).await.unwrap();
+                        // Read what we can
+                        let mut buf = vec![0u8; size as usize];
+                        if size > 0 {
+                            file.read_exact(&mut buf).await.unwrap();
+                        }
+                        let content_byte = if buf.is_empty() { 255 } else { buf[0] };
+                        eprintln!("File {} has size {} (expected 1024), first byte: {} (expected {})",
+                            filename, size, content_byte, i);
+                        if size != 1024 || content_byte != i as u8 {
+                            issues.push(format!("{}: size={} content={}", filename, size, content_byte));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("File {} failed to open: {:?}", filename, e);
+                        issues.push(format!("{}: open failed", filename));
+                    }
+                }
+            }
+            if !issues.is_empty() {
+                eprintln!("NOT cleaning up image for debugging: {}", path);
+                // Dump the directory entries
+                eprintln!("Dumping directory entry positions:");
+                eprintln!("  File 7 entry should be at ~82528");
+                panic!("File corruption detected: {:?}", issues);
             }
 
             cleanup_test_image(path);

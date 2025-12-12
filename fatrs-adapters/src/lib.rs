@@ -101,3 +101,14 @@ pub use infrastructure::streaming::HeapPageStream;
 
 // Re-export embedded_io_async for convenience
 pub use embedded_io_async;
+
+// Re-export fatrs_block_device types for convenience
+// This allows users to depend only on fatrs-adapters without needing fatrs-block-device directly
+pub use fatrs_block_device::{
+    BlockDevice,
+    SendBlockDevice,
+    blocks_to_slice,
+    blocks_to_slice_mut,
+    slice_to_blocks,
+    slice_to_blocks_mut,
+};

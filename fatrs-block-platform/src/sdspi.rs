@@ -97,15 +97,22 @@ where
     Ok(())
 }
 
+use core::cell::RefCell;
+
+/// Inner state for SdSpi that requires mutable access
+struct SdSpiInner<SPI, D> {
+    spi: SPI,
+    delay: D,
+    card: Option<Card>,
+}
+
 pub struct SdSpi<SPI, D, ALIGN>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     D: embedded_hal_async::delay::DelayNs,
     ALIGN: aligned::Alignment,
 {
-    spi: SPI,
-    delay: D,
-    card: Option<Card>,
+    inner: RefCell<SdSpiInner<SPI, D>>,
     _align: PhantomData<ALIGN>,
 }
 
@@ -117,15 +124,55 @@ where
 {
     pub fn new(spi: SPI, delay: D) -> Self {
         Self {
-            spi,
-            delay,
-            card: None,
+            inner: RefCell::new(SdSpiInner {
+                spi,
+                delay,
+                card: None,
+            }),
             _align: PhantomData,
         }
     }
 
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
     pub async fn init(&mut self) -> Result<(), Error> {
+        let inner = self.inner.get_mut();
+        inner.init_impl().await
+    }
+
+    pub async fn read<const SIZE: usize>(
+        &self,
+        block_address: u32,
+        data: &mut [Aligned<ALIGN, [u8; SIZE]>],
+    ) -> Result<(), Error> {
+        let mut inner = self.inner.borrow_mut();
+        inner.read_impl(block_address, data).await
+    }
+
+    pub async fn write<const SIZE: usize>(
+        &mut self,
+        block_address: u32,
+        data: &[Aligned<ALIGN, [u8; SIZE]>],
+    ) -> Result<(), Error> {
+        let inner = self.inner.get_mut();
+        inner.write_impl(block_address, data).await
+    }
+
+    pub async fn size(&self) -> Result<u64, Error> {
+        let inner = self.inner.borrow();
+        Ok(inner.card.ok_or(Error::NotInitialized)?.size())
+    }
+
+    pub fn spi(&mut self) -> &mut SPI {
+        &mut self.inner.get_mut().spi
+    }
+}
+
+impl<SPI, D> SdSpiInner<SPI, D>
+where
+    SPI: embedded_hal_async::spi::SpiDevice,
+    D: embedded_hal_async::delay::DelayNs + Clone,
+{
+    async fn init_impl(&mut self) -> Result<(), Error> {
         async {
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
@@ -225,7 +272,7 @@ where
         .await
     }
 
-    pub async fn read<const SIZE: usize>(
+    async fn read_impl<const SIZE: usize, ALIGN: aligned::Alignment>(
         &mut self,
         block_address: u32,
         data: &mut [Aligned<ALIGN, [u8; SIZE]>],
@@ -250,7 +297,7 @@ where
         Ok(())
     }
 
-    pub async fn write<const SIZE: usize>(
+    async fn write_impl<const SIZE: usize, ALIGN: aligned::Alignment>(
         &mut self,
         block_address: u32,
         data: &[Aligned<ALIGN, [u8; SIZE]>],
@@ -294,10 +341,6 @@ where
         r?;
 
         Ok(())
-    }
-
-    pub async fn size(&mut self) -> Result<u64, Error> {
-        Ok(self.card.ok_or(Error::NotInitialized)?.size())
     }
 
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
@@ -352,10 +395,6 @@ where
         }
 
         Ok(())
-    }
-
-    pub fn spi(&mut self) -> &mut SPI {
-        &mut self.spi
     }
 
     async fn cmd<R: Resp>(&mut self, cmd: Cmd<R>) -> Result<u8, Error> {
@@ -432,11 +471,11 @@ where
     type Align = ALIGN;
 
     async fn read(
-        &mut self,
+        &self,
         block_address: u32,
         data: &mut [Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.read(block_address, data).await
+        SdSpi::read(self, block_address, data).await
     }
 
     async fn write(
@@ -444,11 +483,17 @@ where
         block_address: u32,
         data: &[Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Self::Error> {
-        self.write(block_address, data).await
+        SdSpi::write(self, block_address, data).await
     }
 
-    async fn size(&mut self) -> Result<u64, Self::Error> {
-        self.size().await
+    async fn size(&self) -> Result<u64, Self::Error> {
+        SdSpi::size(self).await
+    }
+
+    async fn sync(&mut self) -> Result<(), Self::Error> {
+        // SD cards don't have a specific sync command in SPI mode
+        // Writes are complete after the data response token
+        Ok(())
     }
 }
 

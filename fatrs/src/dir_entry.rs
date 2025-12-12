@@ -531,6 +531,20 @@ impl DirEntryEditor {
         }
     }
 
+    /// Refresh the generation counter from the filesystem.
+    ///
+    /// This should be called after operations that free clusters (like truncate)
+    /// to ensure the generation counter matches the filesystem's current value.
+    /// Without this, the stale detection would incorrectly reject valid flushes
+    /// after truncate operations that free data clusters.
+    pub(crate) fn refresh_generation<IO: ReadWriteSeek, TP, OCC>(
+        &mut self,
+        fs: &FileSystem<IO, TP, OCC>,
+    ) {
+        use core::sync::atomic::Ordering;
+        self.generation = fs.cluster_generation.load(Ordering::Acquire);
+    }
+
     pub(crate) async fn flush<IO: ReadWriteSeek, TP, OCC>(
         &mut self,
         fs: &FileSystem<IO, TP, OCC>,
@@ -566,6 +580,9 @@ impl DirEntryEditor {
             // Position is valid - generation hasn't changed
             disk.seek(io::SeekFrom::Start(self.pos)).await?;
             self.data.serialize(&mut *disk).await?;
+            // Flush to ensure entry is visible to subsequent reads.
+            // Without this, directory reads could see stale data.
+            disk.flush().await?;
         }
         Ok(())
     }

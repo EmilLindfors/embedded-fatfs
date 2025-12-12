@@ -65,7 +65,7 @@ where
     type Error = D::Error;
 
     async fn read_blocks(
-        &mut self,
+        &self,
         start: BlockAddress,
         dest: &mut [u8],
     ) -> Result<(), Self::Error> {
@@ -100,6 +100,7 @@ where
         #[cfg(not(feature = "alloc"))]
         {
             // Without alloc, we can't handle large reads
+            let _ = start; // Suppress unused variable warning
             panic!("Cannot allocate buffer for {} blocks without alloc feature", blocks_needed);
         }
     }
@@ -139,19 +140,27 @@ where
 
         #[cfg(not(feature = "alloc"))]
         {
+            let _ = start; // Suppress unused variable warning
             panic!("Cannot allocate buffer for {} blocks without alloc feature", blocks_needed);
         }
     }
 
-    async fn size(&mut self) -> Result<u64, Self::Error> {
+    async fn size(&self) -> Result<u64, Self::Error> {
         self.device.size().await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.device.sync().await
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use aligned::Aligned;
     use std::collections::HashMap;
+
+    const BLOCK_SIZE: usize = 512;
 
     // Mock BlockDevice for testing
     pub(crate) struct MockBlockDevice<const BLOCK_SIZE: usize> {
@@ -173,7 +182,7 @@ pub(crate) mod tests {
         type Align = aligned::A4;
 
         async fn read(
-            &mut self,
+            &self,
             block_address: u32,
             data: &mut [Aligned<Self::Align, [u8; BLOCK_SIZE]>],
         ) -> Result<(), Self::Error> {
@@ -203,14 +212,18 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn size(&mut self) -> Result<u64, Self::Error> {
+        async fn size(&self) -> Result<u64, Self::Error> {
             Ok(self.size)
+        }
+
+        async fn sync(&mut self) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
     #[tokio::test]
     async fn test_adapter_read_write() {
-        let device = MockBlockDevice::<512>::new(1024 * 1024);
+        let device = MockBlockDevice::<BLOCK_SIZE>::new(1024 * 1024);
         let mut adapter = BlockDeviceAdapter::new(device);
 
         // Write some data
@@ -220,7 +233,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // Read it back
+        // Read it back (read_blocks takes &self)
         let mut read_data = vec![0u8; 1024];
         adapter
             .read_blocks(BlockAddress::new(0), &mut read_data)
@@ -232,16 +245,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_adapter_size() {
-        let device = MockBlockDevice::<512>::new(2048);
-        let mut adapter = BlockDeviceAdapter::new(device);
+        let device = MockBlockDevice::<BLOCK_SIZE>::new(2048);
+        let adapter = BlockDeviceAdapter::new(device);
 
+        // size takes &self
         let size = adapter.size().await.unwrap();
         assert_eq!(size, 2048);
     }
 
     #[tokio::test]
     async fn test_adapter_partial_block_write() {
-        let device = MockBlockDevice::new(1024 * 1024);
+        let device = MockBlockDevice::<BLOCK_SIZE>::new(1024 * 1024);
         let mut adapter = BlockDeviceAdapter::new(device);
 
         // Write less than a full block

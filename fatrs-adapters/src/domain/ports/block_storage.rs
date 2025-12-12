@@ -75,7 +75,7 @@ pub trait BlockStorage: Send + Sync {
     /// storage.read_blocks(addr, &mut buffer).await?;
     /// ```
     async fn read_blocks(
-        &mut self,
+        &self,
         start: BlockAddress,
         dest: &mut [u8],
     ) -> Result<(), Self::Error>;
@@ -119,7 +119,7 @@ pub trait BlockStorage: Send + Sync {
     /// let size = storage.size().await?;
     /// let num_pages = size / 4096;
     /// ```
-    async fn size(&mut self) -> Result<u64, Self::Error>;
+    async fn size(&self) -> Result<u64, Self::Error>;
 
     /// Flush any cached writes to the underlying storage.
     ///
@@ -169,7 +169,7 @@ mod tests {
         type Error = MockError;
 
         async fn read_blocks(
-            &mut self,
+            &self,
             start: BlockAddress,
             dest: &mut [u8],
         ) -> Result<(), Self::Error> {
@@ -210,7 +210,7 @@ mod tests {
             Ok(())
         }
 
-        async fn size(&mut self) -> Result<u64, Self::Error> {
+        async fn size(&self) -> Result<u64, Self::Error> {
             Ok(1024 * 1024) // 1MB
         }
     }
@@ -238,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_storage_size() {
-        let mut storage = MockStorage::new(512);
+        let storage = MockStorage::new(512);
         let size = storage.size().await.unwrap();
         assert_eq!(size, 1024 * 1024);
     }

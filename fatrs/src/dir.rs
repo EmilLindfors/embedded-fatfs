@@ -348,8 +348,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     e = e.find_entry(name, Some(true), None).await?.to_dir();
                 }
                 None => {
-                    let mut file = e.find_entry(name, Some(false), None).await?.to_file();
-                    #[cfg(feature = "audit-log")]
+                    let file = e.find_entry(name, Some(false), None).await?.to_file();
                     return Ok(file);
                 }
             }
@@ -399,10 +398,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     FileAttributes::from_bits_truncate(0),
                     None,
                 );
-                let mut file = parent.write_entry(name, sfn_entry).await?.to_file();
-
-                // Set file path for audit logging
-                #[cfg(feature = "audit-log")]
+                let file = parent.write_entry(name, sfn_entry).await?.to_file();
 
                 // Audit log: file created
                 #[cfg(feature = "audit-log")]
@@ -419,8 +415,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
             }
             // file already exists - return it
             DirEntryOrShortName::DirEntry(e) => {
-                let mut file = e.to_file();
-                #[cfg(feature = "audit-log")]
+                let file = e.to_file();
                 Ok(file)
             }
         }
@@ -853,7 +848,12 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         };
         // free long and short name entries
         let mut stream = self.stream.clone();
-        stream.seek(SeekFrom::Start(e.offset_range.0)).await?;
+
+        // Calculate relative offset within the stream
+        // offset_range contains absolute positions, but streams expect relative offsets
+        let stream_start_abs_pos = stream.abs_pos().unwrap_or(0);
+        let relative_offset = e.offset_range.0.saturating_sub(stream_start_abs_pos);
+        stream.seek(SeekFrom::Start(relative_offset)).await?;
         let num = ((e.offset_range.1 - e.offset_range.0) / u64::from(DIR_ENTRY_SIZE)) as usize;
         for _ in 0..num {
             let mut data = DirEntryData::deserialize(&mut stream).await?;
@@ -877,6 +877,12 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         &self,
         num_entries: u32,
     ) -> Result<DirRawStream<'a, IO, TP, OCC>, Error<IO::Error>> {
+        // Flush any dirty directory entries before reading to ensure consistency.
+        // This prevents cache corruption when multiple files are created in the
+        // same directory - without this, a read could see stale metadata.
+        #[cfg(feature = "alloc")]
+        self.fs.flush_dirty_dir_entries().await?;
+
         let mut stream = self.stream.clone();
         let mut first_free: u32 = 0;
         let mut num_free: u32 = 0;
