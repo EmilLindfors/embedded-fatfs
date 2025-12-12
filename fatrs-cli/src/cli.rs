@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use embedded_io_adapters::tokio_1::FromTokio;
 use fatrs::{FatType, FormatVolumeOptions, FsOptions};
-use fatrs_adapters::{LargePageStream, presets};
+use fatrs_adapters::{HeapPageStream, presets};
 use fatrs_block_platform::StreamBlockDevice;
+use fatrs_cli::path_parser::{PathSpec, parse_copy_operation};
+use log::{info, debug};
 
 /// Page size presets for I/O buffering
 #[derive(Copy, Clone, Debug, Default, ValueEnum)]
@@ -58,7 +60,24 @@ impl PageSize {
 
 /// FAT Filesystem CLI Tool
 #[derive(Parser, Debug)]
-#[command(author, version, about = "CLI tool for FAT filesystem operations")]
+#[command(
+    author,
+    version,
+    about = "CLI tool for FAT filesystem operations",
+    long_about = "CLI tool for FAT filesystem operations\n\n\
+        PATH NOTATION:\n  \
+        This tool uses a clear notation to distinguish between host and image paths:\n  \
+        - image.img:path/to/file  ->  Path within the FAT image\n  \
+        - ./path/to/file          ->  Path on host filesystem\n  \
+        - /path/to/file           ->  Path on host filesystem\n\n\
+        This is similar to the 'host:path' syntax used by scp and rsync.\n\n\
+        EXAMPLES:\n  \
+        fatrs ls test.img                      # List files in image\n  \
+        fatrs cat test.img:file.txt            # Display file from image\n  \
+        fatrs cp host.txt test.img:dest.txt    # Copy host file into image\n  \
+        fatrs cp test.img:src.txt ./output/    # Copy from image to host\n  \
+        fatrs rm test.img:file.txt             # Remove file from image"
+)]
 pub struct Cli {
     /// Page buffer size for I/O operations
     ///
@@ -98,23 +117,33 @@ pub enum Command {
     },
 
     /// Display contents of a file
+    #[command(long_about = "Display contents of a file from a FAT image\n\n\
+        EXAMPLES:\n  \
+        fatrs cat test.img:file.txt              # Display file from root\n  \
+        fatrs cat test.img:dir/file.txt          # Display file from subdirectory\n  \
+        fatrs cat test.img file.txt              # Alternative syntax")]
     Cat {
-        /// Path to FAT filesystem image
-        image: PathBuf,
-
-        /// Path to file within the filesystem
+        /// Path to file (use 'image.img:path' notation or specify image and path separately)
         path: String,
     },
 
     /// Copy files to/from a FAT image
+    #[command(long_about = "Copy files to/from a FAT image\n\n\
+        EXAMPLES:\n  \
+        fatrs cp host.txt test.img:dest.txt      # Copy host file into image\n  \
+        fatrs cp test.img:src.txt ./output/      # Copy from image to host\n  \
+        fatrs cp -r ./dir/ test.img:destdir/     # Copy directory into image\n  \
+        fatrs cp -r test.img:dir/ ./output/      # Copy directory from image\n\n\
+        PATH NOTATION:\n  \
+        Use image.img:path notation to specify paths within the image:\n  \
+        - image.img:file.txt  ->  Path within the FAT image\n  \
+        - ./file.txt          ->  Path on host filesystem\n\n\
+        One path must be in the image, the other on the host.")]
     Cp {
-        /// Path to FAT filesystem image
-        image: PathBuf,
-
-        /// Source path (host filesystem or inside image with : prefix)
+        /// Source path (use 'image.img:path' for image paths, or host path)
         source: String,
 
-        /// Destination path (host filesystem or inside image with : prefix)
+        /// Destination path (use 'image.img:path' for image paths, or host path)
         dest: String,
 
         /// Recursively copy directories
@@ -123,11 +152,13 @@ pub enum Command {
     },
 
     /// Create a directory in a FAT image
+    #[command(long_about = "Create a directory in a FAT image\n\n\
+        EXAMPLES:\n  \
+        fatrs mkdir test.img:newdir              # Create directory in root\n  \
+        fatrs mkdir test.img:dir/subdir          # Create subdirectory\n  \
+        fatrs mkdir -p test.img:a/b/c            # Create parent directories as needed")]
     Mkdir {
-        /// Path to FAT filesystem image
-        image: PathBuf,
-
-        /// Path to create
+        /// Path to create (use 'image.img:path' notation or specify image and path separately)
         path: String,
 
         /// Create parent directories as needed
@@ -136,11 +167,18 @@ pub enum Command {
     },
 
     /// Remove a file or directory from a FAT image
+    #[command(long_about = "Remove a file or directory from a FAT image\n\n\
+        EXAMPLES:\n  \
+        fatrs rm test.img:file.txt               # Remove file from root\n  \
+        fatrs rm test.img:dir/file.txt           # Remove file from subdirectory\n  \
+        fatrs rm -r test.img:directory/          # Remove directory recursively\n\n\
+        PATH NOTATION:\n  \
+        You can use either:\n  \
+        - fatrs rm test.img:path     (explicit image:path notation)\n  \
+        - fatrs rm test.img path     (image specified separately)\n\n\
+        The image:path notation is recommended for clarity.")]
     Rm {
-        /// Path to FAT filesystem image
-        image: PathBuf,
-
-        /// Path to remove
+        /// Path to remove (use 'image.img:path' notation or specify image separately)
         path: String,
 
         /// Recursively remove directories
@@ -168,6 +206,21 @@ pub enum Command {
         /// Source directory to copy into the image
         #[arg(short, long)]
         from: Option<PathBuf>,
+
+        /// Enable transaction log for power-loss resilience (requires transaction-safe feature)
+        #[cfg(feature = "transaction-safe")]
+        #[arg(long)]
+        transaction_log: bool,
+
+        /// Custom transaction log start sector (0 for automatic placement)
+        #[cfg(feature = "transaction-safe")]
+        #[arg(long, requires = "transaction_log")]
+        log_sector: Option<u32>,
+
+        /// Number of sectors for transaction log (default: 4)
+        #[cfg(feature = "transaction-safe")]
+        #[arg(long, requires = "transaction_log", default_value = "4")]
+        log_count: u32,
     },
 
     /// Extract all files from a FAT image to a directory
@@ -177,6 +230,19 @@ pub enum Command {
 
         /// Destination directory
         dest: PathBuf,
+    },
+
+    /// View transaction log (requires transaction-safe feature)
+    #[cfg(feature = "transaction-safe")]
+    TxLog {
+        /// Path to FAT filesystem image
+        image: PathBuf,
+    },
+
+    /// View audit log
+    AuditLog {
+        /// Path to FAT filesystem image
+        image: PathBuf,
     },
 
     /// Work with physical flash drives (Windows only)
@@ -287,7 +353,7 @@ async fn open_fs_buffered(
     page_size: usize,
 ) -> Result<(
     fatrs::FileSystem<
-        LargePageStream<StreamBlockDevice<FromTokio<tokio::fs::File>>>,
+        HeapPageStream<StreamBlockDevice<FromTokio<tokio::fs::File>>, 512>,
         fatrs::DefaultTimeProvider,
         fatrs::LossyOemCpConverter,
     >,
@@ -301,7 +367,7 @@ async fn open_fs_buffered(
         .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
     let block_dev = StreamBlockDevice(FromTokio::new(file));
-    let stream = LargePageStream::new(block_dev, page_size)
+    let stream = HeapPageStream::new(block_dev, page_size)
         .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
     let fs = fatrs::FileSystem::new(stream, FsOptions::new())
@@ -322,29 +388,74 @@ pub async fn run(cli: Cli) -> Result<()> {
             recursive,
         } => cmd_ls(&image, &path, long, recursive, page_size).await,
         Command::Info { image } => cmd_info(&image, page_size).await,
-        Command::Cat { image, path } => cmd_cat(&image, &path, page_size).await,
+        Command::Cat { path } => {
+            let path_spec = PathSpec::parse(&path)?;
+            match path_spec {
+                PathSpec::ImagePath { image, path } => {
+                    cmd_cat(&image, &path, page_size).await
+                }
+                PathSpec::HostPath(_) => {
+                    anyhow::bail!(
+                        "Cat command requires an image path. Use 'image.img:path' notation.\n\
+                        Example: fatrs cat test.img:file.txt"
+                    )
+                }
+            }
+        }
         Command::Cp {
-            image,
             source,
             dest,
             recursive,
-        } => cmd_cp(&image, &source, &dest, recursive, page_size).await,
+        } => {
+            let (src, dst) = parse_copy_operation(&source, &dest)?;
+            cmd_cp_new(src, dst, recursive, page_size).await
+        }
         Command::Mkdir {
-            image,
             path,
             parents,
-        } => cmd_mkdir(&image, &path, parents, page_size).await,
+        } => {
+            let path_spec = PathSpec::parse(&path)?;
+            match path_spec {
+                PathSpec::ImagePath { image, path } => {
+                    cmd_mkdir(&image, &path, parents, page_size).await
+                }
+                PathSpec::HostPath(_) => {
+                    anyhow::bail!(
+                        "Mkdir command requires an image path. Use 'image.img:path' notation.\n\
+                        Example: fatrs mkdir test.img:newdir"
+                    )
+                }
+            }
+        }
         Command::Rm {
-            image,
             path,
             recursive,
-        } => cmd_rm(&image, &path, recursive, page_size).await,
+        } => {
+            let path_spec = PathSpec::parse(&path)?;
+            match path_spec {
+                PathSpec::ImagePath { image, path } => {
+                    cmd_rm(&image, &path, recursive, page_size).await
+                }
+                PathSpec::HostPath(_) => {
+                    anyhow::bail!(
+                        "Rm command requires an image path. Use 'image.img:path' notation.\n\
+                        Example: fatrs rm test.img:file.txt"
+                    )
+                }
+            }
+        }
         Command::Create {
             image,
             size,
             fat_type,
             label,
             from,
+            #[cfg(feature = "transaction-safe")]
+            transaction_log,
+            #[cfg(feature = "transaction-safe")]
+            log_sector,
+            #[cfg(feature = "transaction-safe")]
+            log_count,
         } => {
             cmd_create(
                 &image,
@@ -353,10 +464,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                 label.as_deref(),
                 from.as_deref(),
                 page_size,
+                #[cfg(feature = "transaction-safe")]
+                transaction_log,
+                #[cfg(feature = "transaction-safe")]
+                log_sector,
+                #[cfg(feature = "transaction-safe")]
+                log_count,
             )
             .await
         }
         Command::Extract { image, dest } => cmd_extract(&image, &dest, page_size).await,
+        #[cfg(feature = "transaction-safe")]
+        Command::TxLog { image } => cmd_txlog(&image, page_size).await,
+        Command::AuditLog { image } => cmd_auditlog(&image, page_size).await,
         #[cfg(windows)]
         Command::Flash { command } => cmd_flash(command, page_size).await,
     }
@@ -545,78 +665,98 @@ async fn cmd_cat(image: &Path, path: &str, page_size: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_cp(
-    image: &Path,
-    source: &str,
-    dest: &str,
+/// New copy command implementation using PathSpec
+async fn cmd_cp_new(
+    src: PathSpec,
+    dst: PathSpec,
     recursive: bool,
     page_size: usize,
 ) -> Result<()> {
-    // Detect whether paths are in the image or on the host
-    // Paths prefixed with : are explicitly inside the image
-    // Otherwise, check if the path exists on the host filesystem
-    let src_explicit_image = source.starts_with(':');
-    let dst_explicit_image = dest.starts_with(':');
+    match (src, dst) {
+        (PathSpec::ImagePath { image: src_image, path: src_path }, PathSpec::HostPath(dst_path)) => {
+            // Copy from image to host
+            let (fs, _) = open_fs_buffered(&src_image, false, page_size).await?;
+            let root = fs.root_dir();
 
-    let src_path = source.trim_start_matches(':');
-    let dst_path = dest.trim_start_matches(':');
-
-    // Determine actual location of source and destination
-    let src_in_image = if src_explicit_image {
-        true
-    } else {
-        // If source doesn't exist on host, assume it's in the image
-        !std::path::Path::new(src_path).exists()
-    };
-
-    let dst_in_image = if dst_explicit_image {
-        true
-    } else {
-        // If destination doesn't exist on host and source is in image, assume dest is on host
-        // If source is on host, assume dest is in image
-        !src_in_image
-    };
-
-    if src_in_image && dst_in_image {
-        anyhow::bail!("Cannot copy within the same image. To copy from image to host, ensure the destination path exists or is a valid host path.");
-    }
-
-    if !src_in_image && !dst_in_image {
-        anyhow::bail!("Cannot copy within host filesystem. Use standard tools like 'cp' instead. To copy to/from the image, use : prefix or ensure one path is in the image.");
-    }
-
-    let (fs, _) = open_fs_buffered(image, dst_in_image, page_size).await?;
-
-    let result = {
-        let root = fs.root_dir();
-
-        if src_in_image {
-            // Copy from image to host filesystem
-            println!("Copying from image:{} to host:{}", src_path, dst_path);
+            info!("Copying from {}:{} to {}", src_image.display(), src_path, dst_path.display());
             copy_from_image(
                 &root,
                 src_path.trim_start_matches('/'),
-                Path::new(dst_path),
+                &dst_path,
                 recursive,
-            )
-            .await
-        } else {
-            // Copy from host filesystem to image
-            println!("Copying from host:{} to image:{}", src_path, dst_path);
-            copy_to_image(
-                &root,
-                Path::new(src_path),
-                dst_path.trim_start_matches('/'),
-                recursive,
-            )
-            .await
+            ).await?;
+
+            Ok(())
         }
-    }; // root is dropped here
+        (PathSpec::HostPath(src_path), PathSpec::ImagePath { image: dst_image, path: dst_path }) => {
+            // Copy from host to image
+            let (fs, _) = open_fs_buffered(&dst_image, true, page_size).await?;
 
-    // Always unmount the filesystem to ensure all changes are flushed
-    fs.unmount().await?;
+            let result = {
+                let root = fs.root_dir();
+                info!("Copying from {} to {}:{}", src_path.display(), dst_image.display(), dst_path);
+                copy_to_image(
+                    &root,
+                    &src_path,
+                    dst_path.trim_start_matches('/'),
+                    recursive,
+                ).await
+            }; // root is dropped here
 
-    result
+            // Always unmount the filesystem to ensure all changes are flushed
+            fs.unmount().await?;
+
+            result
+        }
+        (PathSpec::ImagePath { image: src_image, path: src_path }, PathSpec::ImagePath { image: dst_image, path: dst_path }) => {
+            // Copy between two different images
+            // We need to copy through host filesystem as intermediate
+            let temp_dir = tempfile::tempdir()
+                .context("Failed to create temporary directory for cross-image copy")?;
+
+            info!("Copying from {}:{} to {}:{} (via temporary storage)",
+                     src_image.display(), src_path, dst_image.display(), dst_path);
+
+            // Copy from source image to temp
+            let (src_fs, _) = open_fs_buffered(&src_image, false, page_size).await?;
+            let src_root = src_fs.root_dir();
+            copy_from_image(
+                &src_root,
+                src_path.trim_start_matches('/'),
+                temp_dir.path(),
+                recursive,
+            ).await?;
+            drop(src_root);
+            drop(src_fs);
+
+            // Copy from temp to dest image
+            let (dst_fs, _) = open_fs_buffered(&dst_image, true, page_size).await?;
+            let result = {
+                let dst_root = dst_fs.root_dir();
+
+                // Copy all files from temp directory to destination
+                let mut read_dir = tokio::fs::read_dir(temp_dir.path()).await?;
+                while let Some(entry) = read_dir.next_entry().await? {
+                    let temp_path = entry.path();
+                    copy_to_image(
+                        &dst_root,
+                        &temp_path,
+                        dst_path.trim_start_matches('/'),
+                        recursive,
+                    ).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            dst_fs.unmount().await?;
+            result?;
+
+            Ok(())
+        }
+        _ => {
+            unreachable!("parse_copy_operation should have prevented this case")
+        }
+    }
 }
 
 async fn copy_from_image<IO: fatrs::ReadWriteSeek>(
@@ -692,7 +832,7 @@ where
             tokio::io::AsyncWriteExt::write_all(&mut host_file, &buffer[..n]).await?;
         }
 
-        println!("Copied: {} -> {}", src_path, dst_path.display());
+        debug!("Copied: {} -> {}", src_path, dst_path.display());
     }
 
     Ok(())
@@ -758,7 +898,7 @@ where
         }
         fat_file.flush().await?;
 
-        println!("Copied: {} -> :{}", src_path.display(), dst_path);
+        debug!("Copied: {} -> :{}", src_path.display(), dst_path);
     }
 
     Ok(())
@@ -791,7 +931,7 @@ async fn cmd_mkdir(image: &Path, path: &str, parents: bool, page_size: usize) ->
                 .with_context(|| format!("Failed to create directory: {}", path))?;
         }
 
-        println!("Created directory: {}", path);
+        info!("Created directory: {}", path);
     } // root is dropped here
 
     // Unmount to flush changes
@@ -815,7 +955,7 @@ async fn cmd_rm(image: &Path, path: &str, recursive: bool, page_size: usize) -> 
                 .with_context(|| format!("Failed to remove: {}", path))?;
         }
 
-        println!("Removed: {}", path);
+        info!("Removed: {}", path);
     } // root is dropped here
 
     // Unmount to flush changes
@@ -867,6 +1007,12 @@ async fn cmd_create(
     label: Option<&str>,
     from: Option<&Path>,
     page_size: usize,
+    #[cfg(feature = "transaction-safe")]
+    transaction_log: bool,
+    #[cfg(feature = "transaction-safe")]
+    log_sector: Option<u32>,
+    #[cfg(feature = "transaction-safe")]
+    log_count: u32,
 ) -> Result<()> {
     let size_bytes = parse_size(size)?;
 
@@ -908,7 +1054,16 @@ async fn cmd_create(
         .await
         .context("Failed to format volume")?;
 
-    println!(
+    #[cfg(feature = "transaction-safe")]
+    if transaction_log {
+        if let Some(sector) = log_sector {
+            info!("Transaction log enabled at sector {} ({} sectors)", sector, log_count);
+        } else {
+            info!("Transaction log enabled with automatic placement ({} sectors)", log_count);
+        }
+    }
+
+    info!(
         "Created FAT{} image: {} ({} bytes)",
         fat_type,
         image.display(),
@@ -917,14 +1072,29 @@ async fn cmd_create(
 
     // If source directory specified, copy contents using buffered I/O
     if let Some(from_path) = from {
-        println!("Copying contents from: {}", from_path.display());
+        info!("Copying contents from: {}", from_path.display());
 
-        // Wrap in LargePageStream for efficient copying
+        // Wrap in HeapPageStream for efficient copying
         let block_dev = StreamBlockDevice(io);
-        let stream = LargePageStream::new(block_dev, page_size)
+        let stream = HeapPageStream::new(block_dev, page_size)
             .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
-        let fs = fatrs::FileSystem::new(stream, FsOptions::new())
+        // Configure filesystem options with transaction log if requested
+        #[cfg(feature = "transaction-safe")]
+        let fs_options = if transaction_log {
+            if let Some(sector) = log_sector {
+                FsOptions::new().with_transaction_log_at(sector, log_count)
+            } else {
+                FsOptions::new().with_transaction_log()
+            }
+        } else {
+            FsOptions::new()
+        };
+
+        #[cfg(not(feature = "transaction-safe"))]
+        let fs_options = FsOptions::new();
+
+        let fs = fatrs::FileSystem::new(stream, fs_options)
             .await
             .context("Failed to mount newly created filesystem")?;
 
@@ -932,7 +1102,7 @@ async fn cmd_create(
 
         copy_dir_to_image(&root, from_path, "").await?;
 
-        println!("Done copying files.");
+        info!("Done copying files.");
     }
 
     Ok(())
@@ -980,7 +1150,7 @@ where
             }
             fat_file.flush().await?;
 
-            println!("  Added: {}", dst_path);
+            debug!("  Added: {}", dst_path);
         }
     }
 
@@ -994,9 +1164,9 @@ async fn cmd_extract(image: &Path, dest: &Path, page_size: usize) -> Result<()> 
 
     tokio::fs::create_dir_all(dest).await?;
 
-    println!("Extracting to: {}", dest.display());
+    info!("Extracting to: {}", dest.display());
     copy_from_image(&root, "", dest, true).await?;
-    println!("Done.");
+    info!("Done.");
 
     Ok(())
 }
@@ -1138,13 +1308,12 @@ async fn open_flash_device(
     page_size: usize,
 ) -> Result<(
     fatrs::FileSystem<
-        LargePageStream<StreamBlockDevice<fatrs_cli::AsyncWindowsDevice>>,
+        HeapPageStream<StreamBlockDevice<fatrs_cli::AsyncWindowsDevice>, 512>,
         fatrs::DefaultTimeProvider,
         fatrs::LossyOemCpConverter,
     >,
     usize,
 )> {
-    use fatrs_adapters::LargePageStream;
     use fatrs_block_platform::StreamBlockDevice;
 
     let windows_device = fatrs_cli::AsyncWindowsDevice::open(device, writable)
@@ -1152,7 +1321,7 @@ async fn open_flash_device(
         .with_context(|| format!("Failed to open device: {}", device))?;
 
     let block_dev = StreamBlockDevice(windows_device);
-    let stream = LargePageStream::new(block_dev, page_size)
+    let stream = HeapPageStream::new(block_dev, page_size)
         .map_err(|e| anyhow::anyhow!("Failed to create page stream: {:?}", e))?;
 
     let fs = fatrs::FileSystem::new(stream, FsOptions::new())
@@ -1160,4 +1329,158 @@ async fn open_flash_device(
         .context("Failed to mount FAT filesystem")?;
 
     Ok((fs, page_size))
+}
+
+
+#[cfg(feature = "transaction-safe")]
+async fn cmd_txlog(image: &Path, page_size: usize) -> Result<()> {
+    let (fs, _) = open_fs_buffered(image, false, page_size).await?;
+
+    println!("Transaction Log Status");
+    println!("=====================\n");
+
+    let stats = fs.transaction_statistics().await;
+
+    println!("Total slots:    {}", stats.total_slots);
+    println!("Used slots:     {}", stats.used_slots);
+    println!("Sequence number: {}\n", stats.sequence_number);
+
+    // Get detailed transaction list
+    let transactions = fs.transaction_list().await;
+
+    // Collect valid transactions from the array
+    let valid_transactions: Vec<_> = transactions.iter().filter_map(|t| t.as_ref()).collect();
+
+    if valid_transactions.is_empty() {
+        println!("No transactions in log (all slots empty).");
+    } else {
+        println!("Transactions ({} total):", valid_transactions.len());
+        println!("==================================================");
+
+        // Separate by state
+        let pending: Vec<_> = valid_transactions
+            .iter()
+            .filter(|t| {
+                t.state == fatrs::TransactionState::Pending
+                    || t.state == fatrs::TransactionState::InProgress
+            })
+            .collect();
+
+        let committed: Vec<_> = valid_transactions
+            .iter()
+            .filter(|t| t.state == fatrs::TransactionState::Committed)
+            .collect();
+
+        // Show active/pending first
+        if !pending.is_empty() {
+            println!("\n⚠ Active/Pending Transactions:");
+            for tx in pending {
+                print_transaction(tx);
+            }
+        }
+
+        // Show committed transactions
+        if !committed.is_empty() {
+            println!("\n✓ Committed Transactions:");
+            for tx in committed {
+                print_transaction(tx);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "transaction-safe")]
+fn print_transaction(tx: &fatrs::TransactionInfo) {
+    use chrono::{DateTime, Utc};
+
+    // Convert timestamp to datetime
+    let datetime = DateTime::<Utc>::from_timestamp_millis(tx.timestamp as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .unwrap_or_else(|| format!("{} ms", tx.timestamp));
+
+    // Format transaction type
+    let tx_type_str = format!("{:?}", tx.tx_type);
+
+    // Format state
+    let state_str = format!("{:?}", tx.state);
+
+    println!("\n  Slot #{} | Seq #{} | {} UTC", tx.slot, tx.sequence, datetime);
+    println!("  Type:    {}", tx_type_str);
+    println!("  State:   {}", state_str);
+    println!("  Sectors: {} affected", tx.sector_count);
+
+    if tx.sector_count > 0 {
+        let count = tx.sector_count as usize;
+        let sectors = &tx.affected_sectors[..count];
+        let sectors_str = if count <= 8 {
+            format!("{:?}", sectors)
+        } else {
+            format!(
+                "[{}, {}, {}, ... {} more]",
+                sectors[0],
+                sectors[1],
+                sectors[2],
+                count - 3
+            )
+        };
+        println!("           {}", sectors_str);
+    }
+}
+
+async fn cmd_auditlog(image: &Path, page_size: usize) -> Result<()> {
+    info!("Opening image: {}", image.display());
+
+    // Mount the filesystem
+    let (fs, _) = open_fs_buffered(image, false, page_size).await?;
+
+    println!("Audit Log");
+    println!("=========\n");
+
+    // Get audit log entries
+    let entries = fs.audit_entries().await;
+
+    if entries.is_empty() {
+        println!("No audit entries in buffer.");
+    } else {
+        println!("{} entries in buffer:\n", entries.len());
+
+        for entry in entries {
+            print_audit_entry(&entry);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_audit_entry(entry: &fatrs::AuditEntry) {
+    use chrono::{DateTime, Utc};
+
+    // Convert timestamp to datetime
+    let datetime = DateTime::<Utc>::from_timestamp_millis(entry.timestamp as i64)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .unwrap_or_else(|| format!("{} ms", entry.timestamp));
+
+    // Format operation
+    let op_str = format!("{:?}", entry.operation);
+
+    // Format result with colored indicator
+    let result_str = match entry.result {
+        fatrs::AuditResult::Success => "✓ Success",
+        fatrs::AuditResult::Error => "✗ Error",
+    };
+
+    println!("{} UTC | {} | {}", datetime, result_str, op_str);
+    println!("  Path: {}", entry.get_path());
+
+    if let Some(path2) = entry.get_path2() {
+        println!("  Path2: {}", path2);
+    }
+
+    if entry.data > 0 {
+        println!("  Data: {} bytes", entry.data);
+    }
+
+    println!();
 }

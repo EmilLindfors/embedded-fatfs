@@ -134,14 +134,14 @@ async fn open_image_file(
         #[cfg(windows)]
         {
             // Open Windows device
-            use fatrs_adapters::{LargePageStream, presets};
+            use fatrs_adapters::{HeapPageStream, presets};
 
             let device = fatrs_cli::AsyncWindowsDevice::open(image_path, false)
                 .await
                 .with_context(|| format!("Failed to open device: {}", image_path))?;
 
             let block_dev = fatrs_block_platform::StreamBlockDevice(device);
-            let stream = LargePageStream::new(block_dev, presets::PAGE_4K)
+            let stream = HeapPageStream::new(block_dev, presets::PAGE_4K)
                 .with_context(|| "Failed to create page stream")?;
 
             let io = UnifiedIO::Device(stream);

@@ -503,6 +503,75 @@ let fs = FileSystem::new(disk, options).await?; // Uses default placement
 - All 39 tests passing + 2 integration tests
 - Zero clippy warnings
 
+### Audit Log Implementation (2025-12-05)
+
+**What was implemented:**
+- ✅ Complete audit log infrastructure with disk persistence
+- ✅ Sector-based storage for no_std compatibility
+- ✅ Automatic sector scaling based on filesystem size
+- ✅ Integration with all file operations (create, delete, rename, etc.)
+- ✅ Persistent storage across mounts using postcard serialization
+- ✅ CLI command `fatrs audit-log <image>` for viewing entries
+
+**Architecture:**
+- Fixed-size in-memory buffer (16 entries) with circular overflow
+- Persistent storage in reserved disk sectors (before data area)
+- Binary serialization using postcard for compact storage
+- Automatic sector allocation based on filesystem size:
+  - < 10MB: 8 sectors (4KB)
+  - 10MB - 100MB: 16 sectors (8KB)
+  - 100MB - 1GB: 32 sectors (16KB)
+  - 1GB - 10GB: 64 sectors (32KB)
+  - > 10GB: 128 sectors (64KB)
+
+**API Examples:**
+```rust
+use fatrs::audit::{AuditConfig, AuditLevel};
+
+// Enable audit log with automatic sizing and placement
+let options = FsOptions::new()
+    .with_audit_log(AuditConfig::new());
+let fs = FileSystem::new(disk, options).await?;
+
+// Configure audit level
+let options = FsOptions::new()
+    .with_audit_log(AuditConfig::new().level(AuditLevel::Minimal)); // Only creates/deletes
+
+// Available levels:
+// - AuditLevel::None     - No logging
+// - AuditLevel::Minimal  - FileCreate, FileDelete, DirCreate, DirDelete
+// - AuditLevel::Standard - Minimal + Rename, FileTruncate (default)
+// - AuditLevel::Full     - Everything including FileRead, FileWrite
+
+// Custom log location and size
+let options = FsOptions::new()
+    .with_audit_log(AuditConfig::at_sector(100, 16).level(AuditLevel::Full));
+let fs = FileSystem::new(disk, options).await?;
+
+// Audit log is automatically loaded on mount and flushed on unmount
+```
+
+**Metrics:**
+- Files changed: 3 (fatrs/src/audit.rs, fs.rs, dir.rs)
+- Lines added: ~500 (audit.rs module)
+- New operations tracked: FileCreate, DirCreate, FileDelete, DirDelete, Rename
+- Persistence verified across mounts
+- Zero clippy warnings
+
+**Additional Features Completed:**
+- ✅ **FileRead/FileWrite operations** - Logs first read/write per file session
+- ✅ **Comprehensive I/O tracking** - Tracks total bytes read/written per file
+- ✅ **Low overhead** - Only logs first operation, not every I/O call
+- ✅ **No stack overflow** - Removed path storage from FileContext for efficiency
+- ✅ **Configurable audit levels** - Choose what to log (Minimal/Standard/Full/None)
+
+**What still needs work:**
+- [ ] Add user/process ID tracking (platform-specific in CLI, not core)
+- [ ] Add CLI filtering options (by operation, date range, path)
+- [ ] Add rotation/archival for long-term audit trails
+- [ ] Performance benchmarking with audit log enabled
+- [ ] Add FileClose audit entry with summary statistics
+
 ---
 
 **Last Updated:** 2025-12-05

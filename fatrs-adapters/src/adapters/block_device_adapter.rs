@@ -3,14 +3,21 @@
 //! This adapter implements the hexagonal architecture pattern by translating
 //! between the domain's `BlockStorage` port and the infrastructure's `BlockDevice`.
 
-use crate::domain::{ports::BlockStorage, value_objects::{BlockAddress, BLOCK_SIZE}};
-use aligned::Aligned;
+use crate::domain::{ports::BlockStorage, value_objects::BlockAddress};
 use fatrs_block_device::BlockDevice;
+
+#[cfg(feature = "alloc")]
+use aligned::Aligned;
 
 /// Adapter that implements BlockStorage using a BlockDevice.
 ///
 /// This is the key adapter in our hexagonal architecture that connects
 /// the domain layer to the actual storage infrastructure.
+///
+/// # Type Parameters
+///
+/// - `D`: The block device type (must implement `BlockDevice<BLOCK_SIZE>`)
+/// - `BLOCK_SIZE`: The block size in bytes (must match the device's block size)
 ///
 /// # Examples
 ///
@@ -24,11 +31,11 @@ use fatrs_block_device::BlockDevice;
 /// // Now use adapter with domain service
 /// let mut buffer = PageBuffer::new(adapter, config);
 /// ```
-pub struct BlockDeviceAdapter<D: BlockDevice<BLOCK_SIZE>> {
+pub struct BlockDeviceAdapter<D: BlockDevice<BLOCK_SIZE>, const BLOCK_SIZE: usize> {
     device: D,
 }
 
-impl<D: BlockDevice<BLOCK_SIZE>> BlockDeviceAdapter<D> {
+impl<D: BlockDevice<BLOCK_SIZE>, const BLOCK_SIZE: usize> BlockDeviceAdapter<D, BLOCK_SIZE> {
     /// Create a new adapter wrapping the given block device.
     pub fn new(device: D) -> Self {
         Self { device }
@@ -50,7 +57,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> BlockDeviceAdapter<D> {
     }
 }
 
-impl<D: BlockDevice<BLOCK_SIZE>> BlockStorage for BlockDeviceAdapter<D>
+impl<D: BlockDevice<BLOCK_SIZE>, const BLOCK_SIZE: usize> BlockStorage for BlockDeviceAdapter<D, BLOCK_SIZE>
 where
     D: Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -147,12 +154,12 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     // Mock BlockDevice for testing
-    pub(crate) struct MockBlockDevice {
+    pub(crate) struct MockBlockDevice<const BLOCK_SIZE: usize> {
         data: HashMap<u32, [u8; BLOCK_SIZE]>,
         size: u64,
     }
 
-    impl MockBlockDevice {
+    impl<const BLOCK_SIZE: usize> MockBlockDevice<BLOCK_SIZE> {
         pub(crate) fn new(size: u64) -> Self {
             Self {
                 data: HashMap::new(),
@@ -161,7 +168,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl BlockDevice<BLOCK_SIZE> for MockBlockDevice {
+    impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MockBlockDevice<BLOCK_SIZE> {
         type Error = std::io::Error;
         type Align = aligned::A4;
 
@@ -203,7 +210,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_adapter_read_write() {
-        let device = MockBlockDevice::new(1024 * 1024);
+        let device = MockBlockDevice::<512>::new(1024 * 1024);
         let mut adapter = BlockDeviceAdapter::new(device);
 
         // Write some data
@@ -225,7 +232,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_adapter_size() {
-        let device = MockBlockDevice::new(2048);
+        let device = MockBlockDevice::<512>::new(2048);
         let mut adapter = BlockDeviceAdapter::new(device);
 
         let size = adapter.size().await.unwrap();

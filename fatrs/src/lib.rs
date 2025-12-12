@@ -124,6 +124,9 @@ mod transaction;
 #[cfg(feature = "file-locking")]
 mod file_locking;
 
+#[cfg(feature = "audit-log")]
+mod audit;
+
 pub use crate::dir::*;
 pub use crate::dir_entry::*;
 pub use crate::error::*;
@@ -133,8 +136,14 @@ pub use crate::time::*;
 
 #[cfg(feature = "transaction-safe")]
 pub use crate::transaction::{
-    TransactionEntry, TransactionLog, TransactionState, TransactionStatistics, TransactionType,
+    TransactionEntry, TransactionInfo, TransactionLog, TransactionState, TransactionStatistics,
+    TransactionType,
 };
 
 #[cfg(feature = "file-locking")]
 pub use crate::file_locking::{FileLockManager, FileLockState, LockType};
+
+#[cfg(feature = "audit-log")]
+pub use crate::audit::{
+    AuditConfig, AuditEntry, AuditLog, AuditOperation, AuditResult,
+};

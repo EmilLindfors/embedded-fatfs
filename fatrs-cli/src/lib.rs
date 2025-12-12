@@ -2,6 +2,8 @@
 //!
 //! Re-exports for CLI utilities.
 
+pub mod path_parser;
+
 // Re-export FUSE adapter from fatrs-fuse
 #[cfg(any(feature = "unix-fuse", feature = "windows-fuse"))]
 pub use fatrs_fuse::FuseAdapter;

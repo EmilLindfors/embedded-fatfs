@@ -3,7 +3,7 @@
 use embedded_io_async::{ErrorType, Read, Seek, SeekFrom, Write};
 
 #[cfg(windows)]
-use fatrs_adapters::LargePageStream;
+use fatrs_adapters::HeapPageStream;
 #[cfg(windows)]
 use fatrs_block_platform::StreamBlockDevice;
 
@@ -11,7 +11,7 @@ use fatrs_block_platform::StreamBlockDevice;
 pub enum UnifiedIO {
     File(embedded_io_adapters::tokio_1::FromTokio<tokio::fs::File>),
     #[cfg(windows)]
-    Device(LargePageStream<StreamBlockDevice<fatrs_cli::AsyncWindowsDevice>>),
+    Device(HeapPageStream<StreamBlockDevice<fatrs_cli::AsyncWindowsDevice>, 512>),
 }
 
 impl ErrorType for UnifiedIO {

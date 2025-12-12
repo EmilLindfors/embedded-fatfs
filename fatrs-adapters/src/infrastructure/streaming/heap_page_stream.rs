@@ -1,10 +1,11 @@
 //! Heap-allocated streaming page buffer with runtime-configurable size.
 
+#[cfg(feature = "alloc")]
 use crate::{
     adapters::{HeapAdapterError, HeapBuffer},
-    domain::BLOCK_SIZE,
     infrastructure::streaming::{SeekFrom, StreamError},
 };
+#[cfg(feature = "alloc")]
 use fatrs_block_device::BlockDevice;
 
 #[cfg(feature = "alloc")]
@@ -18,6 +19,7 @@ extern crate alloc;
 /// # Type Parameters
 ///
 /// - `D`: The block device type
+/// - `BLOCK_SIZE`: The block size in bytes (must match the device's block size)
 ///
 /// # Send/Sync Properties
 ///
@@ -38,18 +40,18 @@ extern crate alloc;
 /// stream.read(&mut buffer).await?;
 /// ```
 #[cfg(feature = "alloc")]
-pub struct HeapPageStream<D>
+pub struct HeapPageStream<D, const BLOCK_SIZE: usize>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
 {
-    buffer: HeapBuffer<D>,
+    buffer: HeapBuffer<D, BLOCK_SIZE>,
     position: u64,
     page_size: usize,
 }
 
 #[cfg(feature = "alloc")]
-impl<D> HeapPageStream<D>
+impl<D, const BLOCK_SIZE: usize> HeapPageStream<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -59,18 +61,18 @@ where
     /// # Arguments
     ///
     /// * `device` - The block device to buffer
-    /// * `page_size` - Size of each page in bytes (must be a multiple of 512)
+    /// * `page_size` - Size of each page in bytes (must be a multiple of BLOCK_SIZE)
     ///
     /// # Errors
     ///
-    /// Returns an error if the page size is invalid (not a multiple of 512 or zero).
+    /// Returns an error if the page size is invalid (not a multiple of BLOCK_SIZE or zero).
     pub fn new(device: D, page_size: usize) -> Result<Self, HeapAdapterError<D::Error>> {
         if page_size == 0 {
             return Err(HeapAdapterError::Domain("Page size must be non-zero".into()));
         }
         if page_size % BLOCK_SIZE != 0 {
             return Err(HeapAdapterError::Domain(
-                alloc::format!("Page size {} must be a multiple of block size (512)", page_size)
+                alloc::format!("Page size {} must be a multiple of block size ({})", page_size, BLOCK_SIZE)
             ));
         }
 
@@ -87,7 +89,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `page_size` is not a multiple of 512 or is zero.
+    /// Panics if `page_size` is not a multiple of BLOCK_SIZE or is zero.
     pub fn new_unwrap(device: D, page_size: usize) -> Self {
         Self::new(device, page_size).expect("Failed to create HeapPageStream with valid page size")
     }

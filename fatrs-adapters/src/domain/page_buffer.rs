@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 ///
 /// - `S`: The storage implementation (must implement `BlockStorage`)
 /// - `T`: The page data storage type (`Vec<u8>` for heap, `[u8; N]` for stack)
+/// - `BLOCK_SIZE`: The block size in bytes (must match the BlockStorage implementation)
 ///
 /// # Examples
 ///
@@ -34,7 +35,7 @@ use alloc::vec::Vec;
 /// use fatrs_adapters::domain::{PageBuffer, PageConfig, PageNumber};
 ///
 /// let storage = MyStorage::new();
-/// let config = PageConfig::new(4096, 8);
+/// let config = PageConfig::<512>::new(4096, 8);
 /// let mut buffer = PageBuffer::new(storage, config);
 ///
 /// // Load a page
@@ -46,25 +47,25 @@ use alloc::vec::Vec;
 /// // Flush changes
 /// buffer.flush().await?;
 /// ```
-pub struct PageBuffer<S: BlockStorage, T> {
+pub struct PageBuffer<S: BlockStorage, T, const BLOCK_SIZE: usize> {
     storage: S,
-    config: PageConfig,
+    config: PageConfig<BLOCK_SIZE>,
     current: Option<Page<T>>,
 }
 
 // Implementation for heap-allocated page buffers
 #[cfg(feature = "alloc")]
-impl<S: BlockStorage> PageBuffer<S, Vec<u8>> {
+impl<S: BlockStorage, const BLOCK_SIZE: usize> PageBuffer<S, Vec<u8>, BLOCK_SIZE> {
     /// Create a new heap-allocated page buffer.
     ///
     /// # Examples
     ///
     /// ```ignore
     /// let storage = MyStorage::new();
-    /// let config = PageConfig::new(4096, 8);
+    /// let config = PageConfig::<512>::new(4096, 8);
     /// let buffer = PageBuffer::new(storage, config);
     /// ```
-    pub fn new(storage: S, config: PageConfig) -> Self {
+    pub fn new(storage: S, config: PageConfig<BLOCK_SIZE>) -> Self {
         Self {
             storage,
             config,
@@ -210,7 +211,7 @@ impl<S: BlockStorage> PageBuffer<S, Vec<u8>> {
     }
 
     /// Get the page configuration.
-    pub const fn config(&self) -> &PageConfig {
+    pub const fn config(&self) -> &PageConfig<BLOCK_SIZE> {
         &self.config
     }
 
@@ -317,17 +318,17 @@ impl<S: BlockStorage> PageBuffer<S, Vec<u8>> {
 }
 
 // Implementation for stack-allocated page buffers
-impl<S: BlockStorage, const N: usize> PageBuffer<S, [u8; N]> {
+impl<S: BlockStorage, const N: usize, const BLOCK_SIZE: usize> PageBuffer<S, [u8; N], BLOCK_SIZE> {
     /// Create a new stack-allocated page buffer.
     ///
     /// # Examples
     ///
     /// ```ignore
     /// let storage = MyStorage::new();
-    /// let config = PageConfig::new(4096, 8);
-    /// let buffer = PageBuffer::<_, 4096>::new_stack(storage, config);
+    /// let config = PageConfig::<512>::new(4096, 8);
+    /// let buffer = PageBuffer::<_, 4096, 512>::new_stack(storage, config);
     /// ```
-    pub fn new_stack(storage: S, config: PageConfig) -> Self {
+    pub fn new_stack(storage: S, config: PageConfig<BLOCK_SIZE>) -> Self {
         Self {
             storage,
             config,
@@ -427,7 +428,7 @@ impl<S: BlockStorage, const N: usize> PageBuffer<S, [u8; N]> {
     }
 
     /// Get the page configuration.
-    pub const fn config(&self) -> &PageConfig {
+    pub const fn config(&self) -> &PageConfig<BLOCK_SIZE> {
         &self.config
     }
 
@@ -582,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_page() {
         let storage = MockStorage::new();
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let mut buffer = PageBuffer::new(storage, config);
 
         buffer.load(PageNumber::new(0)).await.unwrap();
@@ -594,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn test_dirty_page_conflict() {
         let storage = MockStorage::new();
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let mut buffer = PageBuffer::new(storage, config);
 
         // Load page 0 and make it dirty
@@ -609,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn test_modify_and_flush() {
         let storage = MockStorage::new();
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let mut buffer = PageBuffer::new(storage, config);
 
         // Load, modify, and flush
@@ -626,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_same_page_twice() {
         let storage = MockStorage::new();
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let mut buffer = PageBuffer::new(storage, config);
 
         // Load same page twice - should be a no-op
@@ -640,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear() {
         let storage = MockStorage::new();
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let mut buffer = PageBuffer::new(storage, config);
 
         buffer.load(PageNumber::new(0)).await.unwrap();

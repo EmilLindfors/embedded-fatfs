@@ -56,6 +56,17 @@ pub struct FileContext {
     pub(crate) checkpoints: [(u32, u32); 8], // Up to 8 checkpoints
     #[cfg(feature = "cluster-checkpoints")]
     pub(crate) checkpoint_count: u8,
+
+    // Track whether we've logged first read/write for this file session
+    #[cfg(feature = "audit-log")]
+    pub(crate) logged_read: bool,
+    #[cfg(feature = "audit-log")]
+    pub(crate) logged_write: bool,
+    // Track total bytes read/written for summary on close
+    #[cfg(feature = "audit-log")]
+    pub(crate) total_read: u64,
+    #[cfg(feature = "audit-log")]
+    pub(crate) total_written: u64,
 }
 
 /// An extent containing a file's data on disk.
@@ -88,6 +99,14 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 checkpoints: [(0, 0); 8],
                 #[cfg(feature = "cluster-checkpoints")]
                 checkpoint_count: 0,
+                #[cfg(feature = "audit-log")]
+                logged_read: false,
+                #[cfg(feature = "audit-log")]
+                logged_write: false,
+                #[cfg(feature = "audit-log")]
+                total_read: 0,
+                #[cfg(feature = "audit-log")]
+                total_written: 0,
             },
             fs,
             #[cfg(feature = "file-locking")]
@@ -116,6 +135,14 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 checkpoints: [(0, 0); 8],
                 #[cfg(feature = "cluster-checkpoints")]
                 checkpoint_count: 0,
+                #[cfg(feature = "audit-log")]
+                logged_read: false,
+                #[cfg(feature = "audit-log")]
+                logged_write: false,
+                #[cfg(feature = "audit-log")]
+                total_read: 0,
+                #[cfg(feature = "audit-log")]
+                total_written: 0,
             },
             fs,
             lock_info: Some(lock_type),
@@ -409,6 +436,14 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             checkpoints: self.context.checkpoints,
             #[cfg(feature = "cluster-checkpoints")]
             checkpoint_count: self.context.checkpoint_count,
+            #[cfg(feature = "audit-log")]
+            logged_read: self.context.logged_read,
+            #[cfg(feature = "audit-log")]
+            logged_write: self.context.logged_write,
+            #[cfg(feature = "audit-log")]
+            total_read: self.context.total_read,
+            #[cfg(feature = "audit-log")]
+            total_written: self.context.total_written,
         })
     }
 
@@ -444,6 +479,14 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             checkpoints: self.context.checkpoints,
             #[cfg(feature = "cluster-checkpoints")]
             checkpoint_count: self.context.checkpoint_count,
+            #[cfg(feature = "audit-log")]
+            logged_read: self.context.logged_read,
+            #[cfg(feature = "audit-log")]
+            logged_write: self.context.logged_write,
+            #[cfg(feature = "audit-log")]
+            total_read: self.context.total_read,
+            #[cfg(feature = "audit-log")]
+            total_written: self.context.total_written,
         })
     }
 
@@ -644,6 +687,24 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
                 e.set_accessed(now);
             }
         }
+
+        // Audit log: first read operation on this file
+        #[cfg(feature = "audit-log")]
+        if !self.context.logged_read && read_bytes > 0 {
+            self.context.logged_read = true;
+            self.fs.log_audit(
+                crate::audit::AuditOperation::FileRead,
+                "", // No path available at this level
+                crate::audit::AuditResult::Success,
+            ).await;
+        }
+
+        // Track total bytes read for close summary
+        #[cfg(feature = "audit-log")]
+        {
+            self.context.total_read = self.context.total_read.saturating_add(read_bytes as u64);
+        }
+
         Ok(read_bytes)
     }
 }
@@ -747,6 +808,24 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
 
                             self.update_dir_entry_after_write().await?;
                             trace!("multi-cluster write: {} bytes", written_bytes);
+
+                            // Audit log: first write operation on this file
+                            #[cfg(feature = "audit-log")]
+                            if !self.context.logged_write {
+                                self.context.logged_write = true;
+                                self.fs.log_audit(
+                                    crate::audit::AuditOperation::FileWrite,
+                                    "", // No path available at this level
+                                    crate::audit::AuditResult::Success,
+                                ).await;
+                            }
+
+                            // Track total bytes written for close summary
+                            #[cfg(feature = "audit-log")]
+                            {
+                                self.context.total_written = self.context.total_written.saturating_add(written_bytes as u64);
+                            }
+
                             return Ok(written_bytes);
                         }
                         _ => {
@@ -825,6 +904,24 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         }
 
         self.update_dir_entry_after_write().await?;
+
+        // Audit log: first write operation on this file
+        #[cfg(feature = "audit-log")]
+        if !self.context.logged_write && written_bytes > 0 {
+            self.context.logged_write = true;
+            self.fs.log_audit(
+                crate::audit::AuditOperation::FileWrite,
+                "", // No path available at this level
+                crate::audit::AuditResult::Success,
+            ).await;
+        }
+
+        // Track total bytes written for close summary
+        #[cfg(feature = "audit-log")]
+        {
+            self.context.total_written = self.context.total_written.saturating_add(written_bytes as u64);
+        }
+
         Ok(written_bytes)
     }
 

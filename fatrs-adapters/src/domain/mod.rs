@@ -73,7 +73,7 @@ mod page_buffer;
 
 // Re-export commonly used types
 pub use entities::{Page, PageState};
-pub use value_objects::{PageNumber, BlockAddress, PageConfig, PageConfigError, BLOCK_SIZE};
+pub use value_objects::{PageNumber, BlockAddress, PageConfig, PageConfigError, BLOCK_SIZE_512, BLOCK_SIZE_4096, BLOCK_SIZE_128K, BLOCK_SIZE_256K};
 pub use ports::BlockStorage;
 pub use error::DomainError;
 pub use page_buffer::PageBuffer;

@@ -21,12 +21,6 @@ pub use stack_page_stream::StackPageStream;
 #[cfg(feature = "alloc")]
 pub use heap_page_stream::HeapPageStream;
 
-// Legacy aliases for backward compatibility
-pub use stack_page_stream::StackPageStream as PageStream;
-
-#[cfg(feature = "alloc")]
-pub use heap_page_stream::HeapPageStream as LargePageStream;
-
 use core::fmt;
 
 /// Unified I/O error type for streaming operations.

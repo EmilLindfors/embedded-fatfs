@@ -7,18 +7,30 @@ use super::{BlockAddress, PageNumber};
 /// Defines the relationship between pages and blocks, including:
 /// - Page size in bytes
 /// - Number of blocks per page
-/// - Block size (typically 512 bytes)
+/// - Block size (configurable via const generic, typically 512 or 4096 bytes)
+///
+/// # Type Parameters
+///
+/// - `BLOCK_SIZE`: The block size in bytes (e.g., 512 for traditional storage, 4096 for modern SSDs/databases)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageConfig {
+pub struct PageConfig<const BLOCK_SIZE: usize> {
     page_size: usize,
     blocks_per_page: usize,
-    block_size: usize,
 }
 
 /// Standard block size used by most storage devices (512 bytes).
-pub const BLOCK_SIZE: usize = 512;
+pub const BLOCK_SIZE_512: usize = 512;
 
-impl PageConfig {
+/// Modern block size for SSDs and databases (4096 bytes).
+pub const BLOCK_SIZE_4096: usize = 4096;
+
+/// Large block size for high-performance SSDs (128KB).
+pub const BLOCK_SIZE_128K: usize = 128 * 1024;
+
+/// Very large block size for modern NVMe SSDs (256KB).
+pub const BLOCK_SIZE_256K: usize = 256 * 1024;
+
+impl<const BLOCK_SIZE: usize> PageConfig<BLOCK_SIZE> {
     /// Create a new page configuration.
     ///
     /// # Arguments
@@ -36,7 +48,7 @@ impl PageConfig {
     /// use fatrs_adapters::domain::PageConfig;
     ///
     /// // 4KB pages (8 blocks of 512 bytes)
-    /// let config = PageConfig::new(4096, 8);
+    /// let config = PageConfig::<512>::new(4096, 8);
     /// assert_eq!(config.page_size(), 4096);
     /// ```
     pub const fn new(page_size: usize, blocks_per_page: usize) -> Self {
@@ -48,7 +60,6 @@ impl PageConfig {
         Self {
             page_size,
             blocks_per_page,
-            block_size: BLOCK_SIZE,
         }
     }
 
@@ -63,7 +74,7 @@ impl PageConfig {
     /// ```
     /// use fatrs_adapters::domain::PageConfig;
     ///
-    /// let config = PageConfig::from_page_size(4096).unwrap();
+    /// let config = PageConfig::<512>::from_page_size(4096).unwrap();
     /// assert_eq!(config.blocks_per_page(), 8);
     /// ```
     pub const fn from_page_size(page_size: usize) -> Result<Self, PageConfigError> {
@@ -83,7 +94,6 @@ impl PageConfig {
         Ok(Self {
             page_size,
             blocks_per_page,
-            block_size: BLOCK_SIZE,
         })
     }
 
@@ -102,7 +112,7 @@ impl PageConfig {
     /// Get the block size in bytes.
     #[inline]
     pub const fn block_size(&self) -> usize {
-        self.block_size
+        BLOCK_SIZE
     }
 
     /// Convert a page number to its starting block address.
@@ -112,7 +122,7 @@ impl PageConfig {
     /// ```
     /// use fatrs_adapters::domain::{PageConfig, PageNumber, BlockAddress};
     ///
-    /// let config = PageConfig::new(4096, 8);
+    /// let config = PageConfig::<512>::new(4096, 8);
     /// let page = PageNumber::new(2);
     /// let block = config.page_to_block(page);
     /// assert_eq!(block.value(), 16); // 2 pages * 8 blocks/page
@@ -129,7 +139,7 @@ impl PageConfig {
     /// ```
     /// use fatrs_adapters::domain::{PageConfig, BlockAddress, PageNumber};
     ///
-    /// let config = PageConfig::new(4096, 8);
+    /// let config = PageConfig::<512>::new(4096, 8);
     /// let block = BlockAddress::new(16);
     /// let page = config.block_to_page(block);
     /// assert_eq!(page.value(), 2);
@@ -188,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_page_config_creation() {
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         assert_eq!(config.page_size(), 4096);
         assert_eq!(config.blocks_per_page(), 8);
         assert_eq!(config.block_size(), 512);
@@ -196,20 +206,20 @@ mod tests {
 
     #[test]
     fn test_page_config_from_page_size() {
-        let config = PageConfig::from_page_size(4096).unwrap();
+        let config = PageConfig::<512>::from_page_size(4096).unwrap();
         assert_eq!(config.page_size(), 4096);
         assert_eq!(config.blocks_per_page(), 8);
     }
 
     #[test]
     fn test_page_config_invalid_page_size() {
-        let result = PageConfig::from_page_size(4000); // Not multiple of 512
+        let result = PageConfig::<512>::from_page_size(4000); // Not multiple of 512
         assert!(result.is_err());
     }
 
     #[test]
     fn test_page_to_block_conversion() {
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let page = PageNumber::new(2);
         let block = config.page_to_block(page);
         assert_eq!(block.value(), 16);
@@ -217,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_block_to_page_conversion() {
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
         let block = BlockAddress::new(16);
         let page = config.block_to_page(block);
         assert_eq!(page.value(), 2);
@@ -225,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_byte_offset_to_page() {
-        let config = PageConfig::new(4096, 8);
+        let config = PageConfig::<512>::new(4096, 8);
 
         let (page, offset) = config.byte_offset_to_page(0);
         assert_eq!(page.value(), 0);
@@ -238,5 +248,23 @@ mod tests {
         let (page, offset) = config.byte_offset_to_page(5000);
         assert_eq!(page.value(), 1);
         assert_eq!(offset, 904);
+    }
+
+    #[test]
+    fn test_page_config_4096_block_size() {
+        // Test with 4096 byte block size
+        let config = PageConfig::<4096>::new(4096, 1);
+        assert_eq!(config.page_size(), 4096);
+        assert_eq!(config.blocks_per_page(), 1);
+        assert_eq!(config.block_size(), 4096);
+    }
+
+    #[test]
+    fn test_page_config_large_blocks() {
+        // Test with 128KB block size
+        let config = PageConfig::<{128 * 1024}>::new(128 * 1024, 1);
+        assert_eq!(config.page_size(), 128 * 1024);
+        assert_eq!(config.blocks_per_page(), 1);
+        assert_eq!(config.block_size(), 128 * 1024);
     }
 }

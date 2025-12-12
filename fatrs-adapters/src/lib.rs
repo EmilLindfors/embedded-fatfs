@@ -82,11 +82,12 @@ pub mod infrastructure;
 // Re-export commonly used types for convenience
 pub use domain::{
     BlockAddress, BlockStorage, DomainError, Page, PageConfig, PageConfigError, PageNumber,
-    PageState, BLOCK_SIZE,
+    PageState, BLOCK_SIZE_512, BLOCK_SIZE_4096, BLOCK_SIZE_128K, BLOCK_SIZE_256K,
 };
 
 pub use adapters::{
     AdapterError, BlockDeviceAdapter, StackBuffer, StackBuffer2K, StackBuffer4K, StackBuffer8K,
+    StackBuffer4KBlock4K, StackBuffer128KBlock128K,
 };
 
 #[cfg(feature = "alloc")]
@@ -97,12 +98,6 @@ pub use infrastructure::streaming::{StackPageStream, StreamError};
 
 #[cfg(feature = "alloc")]
 pub use infrastructure::streaming::HeapPageStream;
-
-// Legacy aliases for backward compatibility
-pub use infrastructure::streaming::PageStream;
-
-#[cfg(feature = "alloc")]
-pub use infrastructure::streaming::LargePageStream;
 
 // Re-export embedded_io_async for convenience
 pub use embedded_io_async;

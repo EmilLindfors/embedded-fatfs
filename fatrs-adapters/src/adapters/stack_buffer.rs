@@ -2,7 +2,7 @@
 
 use crate::{
     adapters::{BlockDeviceAdapter, error::AdapterError},
-    domain::{PageBuffer, PageConfig, PageNumber, BLOCK_SIZE},
+    domain::{PageBuffer, PageConfig, PageNumber},
 };
 use fatrs_block_device::BlockDevice;
 
@@ -15,37 +15,38 @@ use fatrs_block_device::BlockDevice;
 /// # Type Parameters
 ///
 /// - `D`: The block device type
-/// - `N`: Page size in bytes (must be a multiple of 512)
+/// - `N`: Page size in bytes (must be a multiple of BLOCK_SIZE)
+/// - `BLOCK_SIZE`: The block size in bytes (must match the device's block size)
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use fatrs_adapters::adapters::StackBuffer;
 ///
-/// // 4KB pages
+/// // 4KB pages with 512-byte blocks
 /// let device = MyBlockDevice::new();
-/// let mut buffer = StackBuffer::<_, 4096>::new(device);
+/// let mut buffer = StackBuffer::<_, 4096, 512>::new(device);
 ///
 /// buffer.load(0).await?;
 /// buffer.modify(|data| data[0] = 42)?;
 /// buffer.flush().await?;
 /// ```
-pub struct StackBuffer<D, const N: usize>
+pub struct StackBuffer<D, const N: usize, const BLOCK_SIZE: usize>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
 {
-    inner: PageBuffer<BlockDeviceAdapter<D>, [u8; N]>,
+    inner: PageBuffer<BlockDeviceAdapter<D, BLOCK_SIZE>, [u8; N], BLOCK_SIZE>,
 }
 
-impl<D, const N: usize> StackBuffer<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> StackBuffer<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
 {
     /// Create a new stack-allocated page buffer.
     ///
-    /// The page size is `N` bytes (must be a multiple of 512).
+    /// The page size is `N` bytes (must be a multiple of BLOCK_SIZE).
     pub fn new(device: D) -> Self {
         let adapter = BlockDeviceAdapter::new(device);
         let blocks_per_page = N / BLOCK_SIZE;
@@ -124,16 +125,22 @@ where
     }
 
     /// Get the page configuration.
-    pub const fn config(&self) -> &PageConfig {
+    pub const fn config(&self) -> &PageConfig<BLOCK_SIZE> {
         self.inner.config()
     }
 }
 
-/// Type alias for 4KB page buffer.
-pub type StackBuffer4K<D> = StackBuffer<D, 4096>;
+/// Type alias for 4KB page buffer with 512-byte blocks.
+pub type StackBuffer4K<D> = StackBuffer<D, 4096, 512>;
 
-/// Type alias for 8KB page buffer.
-pub type StackBuffer8K<D> = StackBuffer<D, 8192>;
+/// Type alias for 8KB page buffer with 512-byte blocks.
+pub type StackBuffer8K<D> = StackBuffer<D, 8192, 512>;
 
-/// Type alias for 2KB page buffer.
-pub type StackBuffer2K<D> = StackBuffer<D, 2048>;
+/// Type alias for 2KB page buffer with 512-byte blocks.
+pub type StackBuffer2K<D> = StackBuffer<D, 2048, 512>;
+
+/// Type alias for 4KB page buffer with 4096-byte blocks.
+pub type StackBuffer4KBlock4K<D> = StackBuffer<D, 4096, 4096>;
+
+/// Type alias for 128KB page buffer with 128KB blocks.
+pub type StackBuffer128KBlock128K<D> = StackBuffer<D, { 128 * 1024 }, { 128 * 1024 }>;

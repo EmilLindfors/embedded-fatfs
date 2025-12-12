@@ -292,6 +292,8 @@ pub struct FsOptions<TP, OCC> {
     pub(crate) time_provider: TP,
     #[cfg(feature = "transaction-safe")]
     pub(crate) transaction_log_config: Option<TransactionLogConfig>,
+    #[cfg(feature = "audit-log")]
+    pub(crate) audit_config: crate::audit::AuditConfig,
 }
 
 impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
@@ -304,6 +306,8 @@ impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
             time_provider: DefaultTimeProvider::new(),
             #[cfg(feature = "transaction-safe")]
             transaction_log_config: None,
+            #[cfg(feature = "audit-log")]
+            audit_config: crate::audit::AuditConfig::default(),
         }
     }
 }
@@ -327,6 +331,8 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             time_provider: self.time_provider,
             #[cfg(feature = "transaction-safe")]
             transaction_log_config: self.transaction_log_config,
+            #[cfg(feature = "audit-log")]
+            audit_config: self.audit_config,
         }
     }
 
@@ -338,6 +344,8 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             time_provider,
             #[cfg(feature = "transaction-safe")]
             transaction_log_config: self.transaction_log_config,
+            #[cfg(feature = "audit-log")]
+            audit_config: self.audit_config,
         }
     }
 
@@ -388,6 +396,22 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             log_start_sector,
             log_sector_count,
         });
+        self
+    }
+
+    /// Configure audit logging.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use fatrs::{FsOptions, AuditConfig};
+    ///
+    /// let options = FsOptions::new()
+    ///     .with_audit_log(AuditConfig::new().max_size(2 * 1024 * 1024)); // 2MB max
+    /// ```
+    #[cfg(feature = "audit-log")]
+    #[must_use]
+    pub fn with_audit_log(mut self, config: crate::audit::AuditConfig) -> Self {
+        self.audit_config = config;
         self
     }
 }
@@ -452,6 +476,8 @@ where
     pub(crate) transaction_log: Shared<crate::transaction::TransactionLog>,
     #[cfg(feature = "file-locking")]
     pub(crate) file_locks: Shared<crate::file_locking::FileLockManager>,
+    #[cfg(feature = "audit-log")]
+    pub(crate) audit_log: Shared<crate::audit::AuditLog>,
 }
 
 /// The underlying storage device
@@ -570,6 +596,37 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             config
         };
 
+        // Extract audit log config before moving options
+        #[cfg(feature = "audit-log")]
+        let audit_config = {
+            // Use automatic sizing if sector_count is default (8)
+            // Otherwise use the user-provided configuration
+            let total_sectors = bpb.total_sectors();
+            let mut config = if options.audit_config.log_sector_count == crate::audit::DEFAULT_AUDIT_LOG_SECTORS {
+                crate::audit::AuditConfig::automatic(total_sectors)
+            } else {
+                options.audit_config
+            };
+
+            // If log_start_sector is 0, calculate automatic placement
+            // Place after transaction log (if enabled) or before data area
+            if config.log_start_sector == 0 {
+                #[cfg(feature = "transaction-safe")]
+                {
+                    config.log_start_sector = transaction_log_config.log_start_sector
+                        .saturating_sub(config.log_sector_count);
+                }
+                #[cfg(not(feature = "transaction-safe"))]
+                {
+                    config.log_start_sector = first_data_sector
+                        .saturating_sub(config.log_sector_count);
+                }
+            }
+            trace!("Audit log config: {} sectors starting at sector {}, total_sectors={}",
+                   config.log_sector_count, config.log_start_sector, total_sectors);
+            config
+        };
+
         trace!("FileSystem::new end");
 
         let fs = Self {
@@ -596,6 +653,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             )),
             #[cfg(feature = "file-locking")]
             file_locks: Shared::new(crate::file_locking::FileLockManager::new()),
+            #[cfg(feature = "audit-log")]
+            audit_log: Shared::new(crate::audit::AuditLog::new(audit_config)),
         };
 
         // Build cluster bitmap from FAT (one-time cost at mount for 10-100x allocation speedup)
@@ -666,6 +725,21 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
                 info!("Transaction recovery complete");
             } else {
                 trace!("No incomplete transactions found");
+            }
+        }
+
+        // Load audit log from disk
+        #[cfg(feature = "audit-log")]
+        {
+            trace!("Loading audit log from disk...");
+            let mut audit_log = fs.audit_log.acquire().await;
+            let mut disk = fs.disk.acquire().await;
+
+            if let Err(e) = audit_log.load(&mut *disk).await {
+                // Log error but don't fail mount - audit log is not critical
+                error!("Failed to load audit log: {:?}", e);
+            } else {
+                trace!("Audit log loaded: {} entries", audit_log.len());
             }
         }
 
@@ -978,6 +1052,17 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
         self.flush_fs_info().await?;
 
+        // Flush audit log if enabled
+        #[cfg(feature = "audit-log")]
+        {
+            let mut audit_log = self.audit_log.acquire().await;
+            if audit_log.is_dirty() {
+                let mut disk = self.disk.acquire().await;
+                audit_log.flush(&mut *disk).await.ok(); // Don't fail on audit log flush error
+                trace!("Audit log flushed");
+            }
+        }
+
         // Clear dirty flag on successful unmount
         self.set_dirty_flag(false).await.map_err(|e| Error::Io(e))?;
 
@@ -1205,6 +1290,84 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> FileSystem<IO, TP, OCC> {
             sequence_number: tx_log.sequence,
         }
     }
+
+    /// Get detailed information about all transactions in the log
+    ///
+    /// Returns an array of up to 4 transaction info entries (MAX_TRANSACTIONS).
+    /// Check if each Option is Some to determine valid transactions.
+    #[cfg(feature = "transaction-safe")]
+    pub async fn transaction_list(
+        &self,
+    ) -> [Option<crate::transaction::TransactionInfo>; 4] {
+        let tx_log = self.transaction_log.acquire().await;
+        tx_log.get_all_transaction_info()
+    }
+
+    /// Get audit log entries
+    ///
+    /// Returns all buffered audit log entries. The audit log holds up to 16
+    /// recent entries in memory before they would be written to disk.
+    #[cfg(all(feature = "audit-log", not(feature = "std")))]
+    pub async fn audit_entries(&self) -> alloc::vec::Vec<crate::audit::AuditEntry> {
+        let audit = self.audit_log.acquire().await;
+        audit.entries().cloned().collect()
+    }
+
+    /// Get audit log entries
+    ///
+    /// Returns all buffered audit log entries. The audit log holds up to 16
+    /// recent entries in memory before they would be written to disk.
+    #[cfg(all(feature = "audit-log", feature = "std"))]
+    pub async fn audit_entries(&self) -> Vec<crate::audit::AuditEntry> {
+        let audit = self.audit_log.acquire().await;
+        audit.entries().cloned().collect()
+    }
+
+    /// Helper to get current timestamp for audit logging
+    #[cfg(feature = "audit-log")]
+    fn current_timestamp() -> u64 {
+        #[cfg(feature = "std")]
+        {
+            use std::time::SystemTime;
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // For no_std, use a placeholder timestamp
+            // In real embedded systems, this would come from an RTC
+            0
+        }
+    }
+
+    /// Helper to log an audit entry
+    #[cfg(feature = "audit-log")]
+    pub(crate) async fn log_audit(
+        &self,
+        operation: crate::audit::AuditOperation,
+        path: &str,
+        result: crate::audit::AuditResult,
+    ) {
+        let timestamp = Self::current_timestamp();
+        let mut audit = self.audit_log.acquire().await;
+        audit.log_file_op(timestamp, operation, path, result);
+    }
+
+    /// Helper to log an audit entry with data
+    #[cfg(feature = "audit-log")]
+    pub(crate) async fn log_audit_with_data(
+        &self,
+        operation: crate::audit::AuditOperation,
+        path: &str,
+        result: crate::audit::AuditResult,
+        data: u64,
+    ) {
+        let timestamp = Self::current_timestamp();
+        let mut audit = self.audit_log.acquire().await;
+        audit.log_file_op_with_data(timestamp, operation, path, result, data);
+    }
 }
 
 /// `Drop` implementation tries to unmount the filesystem when dropping.
@@ -1401,8 +1564,10 @@ impl<B, S: IoBase> Seek for DiskSlice<B, S> {
                 .and_then(|n| u64::try_from(n).ok()),
         };
         if let Some(new_offset) = new_offset_opt {
+            trace!("DiskSlice::seek - pos: {:?}, new_offset: {}, self.size: {}, self.begin: {}, self.offset: {}",
+                   pos, new_offset, self.size, self.begin, self.offset);
             if new_offset > self.size {
-                error!("Seek beyond the end of the file");
+                error!("Seek beyond the end of the file - new_offset: {}, self.size: {}", new_offset, self.size);
                 Err(Error::InvalidInput)
             } else {
                 self.offset = new_offset;

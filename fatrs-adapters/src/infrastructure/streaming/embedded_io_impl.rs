@@ -4,12 +4,14 @@
 //! The Send/Sync properties are automatically inherited from the device - no manual
 //! bounds needed!
 
-use crate::{
-    domain::BLOCK_SIZE,
-    infrastructure::streaming::{HeapPageStream, StackPageStream, StreamError},
-};
-use embedded_io_async::{ErrorType, Read, Seek, Write};
+use crate::infrastructure::streaming::StreamError;
 use fatrs_block_device::BlockDevice;
+
+#[cfg(feature = "alloc")]
+use crate::infrastructure::streaming::HeapPageStream;
+
+use crate::infrastructure::streaming::StackPageStream;
+use embedded_io_async::ErrorType;
 
 // Convert our SeekFrom to embedded_io_async's SeekFrom
 fn convert_seek_from(from: embedded_io_async::SeekFrom) -> crate::infrastructure::streaming::SeekFrom {
@@ -21,7 +23,7 @@ fn convert_seek_from(from: embedded_io_async::SeekFrom) -> crate::infrastructure
 }
 
 // Implement for StackPageStream
-impl<D, const N: usize> ErrorType for StackPageStream<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> ErrorType for StackPageStream<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -30,7 +32,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D, const N: usize> Read for StackPageStream<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> embedded_io_async::Read for StackPageStream<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -41,7 +43,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D, const N: usize> Write for StackPageStream<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> embedded_io_async::Write for StackPageStream<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -56,7 +58,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D, const N: usize> Seek for StackPageStream<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> embedded_io_async::Seek for StackPageStream<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -68,7 +70,7 @@ where
 
 // Implement for HeapPageStream
 #[cfg(feature = "alloc")]
-impl<D> ErrorType for HeapPageStream<D>
+impl<D, const BLOCK_SIZE: usize> ErrorType for HeapPageStream<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -77,7 +79,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D> Read for HeapPageStream<D>
+impl<D, const BLOCK_SIZE: usize> embedded_io_async::Read for HeapPageStream<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -88,7 +90,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D> Write for HeapPageStream<D>
+impl<D, const BLOCK_SIZE: usize> embedded_io_async::Write for HeapPageStream<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -103,7 +105,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-impl<D> Seek for HeapPageStream<D>
+impl<D, const BLOCK_SIZE: usize> embedded_io_async::Seek for HeapPageStream<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,

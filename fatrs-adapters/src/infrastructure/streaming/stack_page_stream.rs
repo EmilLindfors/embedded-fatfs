@@ -1,9 +1,8 @@
 //! Stack-allocated streaming page buffer.
 
 use crate::{
-    adapters::{AdapterError, StackBuffer},
-    domain::BLOCK_SIZE,
-    infrastructure::streaming::{SeekFrom, StreamError},
+    adapters::{StackBuffer, AdapterError},
+    infrastructure::streaming::{StreamError, SeekFrom},
 };
 use fatrs_block_device::BlockDevice;
 
@@ -18,7 +17,8 @@ extern crate alloc;
 /// # Type Parameters
 ///
 /// - `D`: The block device type
-/// - `N`: Number of blocks per page (page_size = N * 512 bytes)
+/// - `N`: Page size in bytes (must be a multiple of BLOCK_SIZE)
+/// - `BLOCK_SIZE`: The block size in bytes (must match the device's block size)
 ///
 /// # Send/Sync Properties
 ///
@@ -30,9 +30,9 @@ extern crate alloc;
 /// ```ignore
 /// use fatrs_adapters::infrastructure::StackPageStream;
 ///
-/// // 4KB pages (8 blocks of 512 bytes)
+/// // 4KB pages with 512-byte blocks
 /// let device = MyBlockDevice::new();
-/// let mut stream = StackPageStream::<_, 8>::new(device);
+/// let mut stream = StackPageStream::<_, 4096, 512>::new(device);
 ///
 /// // Use async read/write/seek
 /// stream.write(&[1, 2, 3, 4]).await?;
@@ -40,16 +40,16 @@ extern crate alloc;
 /// let mut buf = [0u8; 4];
 /// stream.read(&mut buf).await?;
 /// ```
-pub struct StackPageStream<D, const N: usize>
+pub struct StackPageStream<D, const N: usize, const BLOCK_SIZE: usize>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
 {
-    buffer: StackBuffer<D, N>,
+    buffer: StackBuffer<D, N, BLOCK_SIZE>,
     position: u64,
 }
 
-impl<D, const N: usize> StackPageStream<D, N>
+impl<D, const N: usize, const BLOCK_SIZE: usize> StackPageStream<D, N, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,

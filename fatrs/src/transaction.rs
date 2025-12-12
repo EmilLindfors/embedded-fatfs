@@ -299,6 +299,26 @@ pub struct TransactionStatistics {
     pub sequence_number: u32,
 }
 
+/// Detailed information about a single transaction
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    /// Slot index in the transaction log
+    pub slot: usize,
+    /// Transaction type
+    pub tx_type: TransactionType,
+    /// Transaction state
+    pub state: TransactionState,
+    /// Sequence number
+    pub sequence: u32,
+    /// Timestamp (milliseconds since epoch)
+    pub timestamp: u64,
+    /// Number of affected sectors
+    pub sector_count: u16,
+    /// List of affected sector numbers (up to 64 sectors)
+    pub affected_sectors: [u32; 64],
+}
+
 impl TransactionLog {
     /// Create a new transaction log
     ///
@@ -486,6 +506,30 @@ impl TransactionLog {
             e.is_valid()
                 && (e.state == TransactionState::Pending || e.state == TransactionState::InProgress)
         })
+    }
+
+    /// Get detailed information about all transactions (including completed ones)
+    ///
+    /// Returns an array of up to MAX_TRANSACTIONS (4) transaction info entries.
+    /// The actual count of valid transactions is determined by checking if the Option is Some.
+    pub fn get_all_transaction_info(&self) -> [Option<TransactionInfo>; MAX_TRANSACTIONS] {
+        let mut result = [None, None, None, None];
+
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if entry.is_valid() && entry.tx_type != TransactionType::None {
+                result[slot] = Some(TransactionInfo {
+                    slot,
+                    tx_type: entry.tx_type,
+                    state: entry.state,
+                    sequence: entry.sequence,
+                    timestamp: entry.timestamp,
+                    sector_count: entry.sector_count,
+                    affected_sectors: entry.affected_sectors,
+                });
+            }
+        }
+
+        result
     }
 }
 

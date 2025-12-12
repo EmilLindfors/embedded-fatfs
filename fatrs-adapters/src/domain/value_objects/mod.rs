@@ -10,4 +10,4 @@ mod page_config;
 
 pub use page_number::PageNumber;
 pub use block_address::BlockAddress;
-pub use page_config::{PageConfig, PageConfigError, BLOCK_SIZE};
+pub use page_config::{PageConfig, PageConfigError, BLOCK_SIZE_512, BLOCK_SIZE_4096, BLOCK_SIZE_128K, BLOCK_SIZE_256K};

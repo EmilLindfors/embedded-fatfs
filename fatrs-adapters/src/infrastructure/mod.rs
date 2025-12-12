@@ -5,5 +5,3 @@
 //! file systems and I/O frameworks.
 
 pub mod streaming;
-
-pub use streaming::{LargePageStream, PageStream};

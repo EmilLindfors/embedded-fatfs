@@ -42,7 +42,7 @@ mod error;
 mod heap_buffer;
 
 pub use block_device_adapter::BlockDeviceAdapter;
-pub use stack_buffer::{StackBuffer, StackBuffer2K, StackBuffer4K, StackBuffer8K};
+pub use stack_buffer::{StackBuffer, StackBuffer2K, StackBuffer4K, StackBuffer8K, StackBuffer4KBlock4K, StackBuffer128KBlock128K};
 pub use error::AdapterError;
 
 #[cfg(feature = "alloc")]

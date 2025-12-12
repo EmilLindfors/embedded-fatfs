@@ -3,7 +3,7 @@
 #[cfg(feature = "alloc")]
 use crate::{
     adapters::{BlockDeviceAdapter, error::HeapAdapterError},
-    domain::{PageBuffer, PageConfig, PageNumber, BLOCK_SIZE},
+    domain::{PageBuffer, PageConfig, PageNumber},
 };
 
 #[cfg(feature = "alloc")]
@@ -23,6 +23,11 @@ use fatrs_block_device::BlockDevice;
 /// - Very large pages are needed (128KB, 1MB, etc.)
 /// - Runtime flexibility is more important than zero allocation
 ///
+/// # Type Parameters
+///
+/// - `D`: The block device type
+/// - `BLOCK_SIZE`: The block size in bytes (must match the device's block size)
+///
 /// # Examples
 ///
 /// ```ignore
@@ -36,16 +41,16 @@ use fatrs_block_device::BlockDevice;
 /// buffer.flush().await?;
 /// ```
 #[cfg(feature = "alloc")]
-pub struct HeapBuffer<D>
+pub struct HeapBuffer<D, const BLOCK_SIZE: usize>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
 {
-    inner: PageBuffer<BlockDeviceAdapter<D>, Vec<u8>>,
+    inner: PageBuffer<BlockDeviceAdapter<D, BLOCK_SIZE>, Vec<u8>, BLOCK_SIZE>,
 }
 
 #[cfg(feature = "alloc")]
-impl<D> HeapBuffer<D>
+impl<D, const BLOCK_SIZE: usize> HeapBuffer<D, BLOCK_SIZE>
 where
     D: BlockDevice<BLOCK_SIZE> + Send + Sync,
     D::Error: core::error::Error + Send + Sync + 'static,
@@ -55,11 +60,11 @@ where
     /// # Arguments
     ///
     /// * `device` - The block device to use for storage
-    /// * `page_size` - Size of each page in bytes (must be multiple of 512)
+    /// * `page_size` - Size of each page in bytes (must be multiple of BLOCK_SIZE)
     ///
     /// # Errors
     ///
-    /// Returns an error if `page_size` is not a multiple of `BLOCK_SIZE` (512).
+    /// Returns an error if `page_size` is not a multiple of `BLOCK_SIZE`.
     pub fn new(device: D, page_size: usize) -> Result<Self, HeapAdapterError<D::Error>> {
         extern crate alloc;
         use alloc::format;
@@ -185,15 +190,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_heap_buffer_creation() {
-        let device = MockBlockDevice::new(1024 * 1024);
+        let device = MockBlockDevice::<512>::new(1024 * 1024);
         let buffer = HeapBuffer::new(device, presets::PAGE_4K);
         assert!(buffer.is_ok());
     }
 
     #[tokio::test]
     async fn test_heap_buffer_invalid_size() {
-        let device = MockBlockDevice::new(1024 * 1024);
+        let device = MockBlockDevice::<512>::new(1024 * 1024);
         let buffer = HeapBuffer::new(device, 4000); // Not a multiple of 512
         assert!(buffer.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_heap_buffer_4k_block_size() {
+        let device = MockBlockDevice::<4096>::new(1024 * 1024);
+        let buffer = HeapBuffer::new(device, 4096);
+        assert!(buffer.is_ok());
     }
 }

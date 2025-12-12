@@ -12,7 +12,7 @@ rust-version = "1.85"
 
 [dependencies]
 # Core fatrs ecosystem
-fatrs = { path = "../fatrs", features = ["transaction-safe", "std", "alloc", "lfn", "unicode", "log", "chrono"], default-features = false }
+fatrs = { path = "../fatrs", features = ["transaction-safe", "audit-log", "std", "alloc", "lfn", "unicode", "log", "chrono"], default-features = false }
 fatrs-adapters = { path = "../fatrs-adapters", features = ["std", "alloc"] }
 fatrs-block-device = { path = "../fatrs-block-device" }
 fatrs-block-platform = { path = "../fatrs-block-platform", features = ["windows"] }
@@ -32,6 +32,7 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
+tempfile = "3"
 
 # TUI dependencies
 ratatui = "0.29"
@@ -45,7 +46,8 @@ tui-textarea = "0.7"
 windows = { version = "0.58", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_SystemServices", "Win32_System_IO"] }
 
 [features]
-default = []
+default = ["transaction-safe"]
+transaction-safe = []
 fuse = ["fatrs-fuse"]
 unix-fuse = ["fuse", "fatrs-fuse/unix-fuse"]
 windows-fuse = ["fuse", "fatrs-fuse/windows-fuse"]

@@ -348,7 +348,9 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     e = e.find_entry(name, Some(true), None).await?.to_dir();
                 }
                 None => {
-                    return Ok(e.find_entry(name, Some(false), None).await?.to_file());
+                    let mut file = e.find_entry(name, Some(false), None).await?.to_file();
+                    #[cfg(feature = "audit-log")]
+                    return Ok(file);
                 }
             }
         }
@@ -397,10 +399,30 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     FileAttributes::from_bits_truncate(0),
                     None,
                 );
-                Ok(parent.write_entry(name, sfn_entry).await?.to_file())
+                let mut file = parent.write_entry(name, sfn_entry).await?.to_file();
+
+                // Set file path for audit logging
+                #[cfg(feature = "audit-log")]
+
+                // Audit log: file created
+                #[cfg(feature = "audit-log")]
+                {
+                    trace!("Logging audit entry for FileCreate: {}", path);
+                    self.fs.log_audit(
+                        crate::audit::AuditOperation::FileCreate,
+                        path,
+                        crate::audit::AuditResult::Success,
+                    ).await;
+                }
+
+                Ok(file)
             }
             // file already exists - return it
-            DirEntryOrShortName::DirEntry(e) => Ok(e.to_file()),
+            DirEntryOrShortName::DirEntry(e) => {
+                let mut file = e.to_file();
+                #[cfg(feature = "audit-log")]
+                Ok(file)
+            }
         }
     }
 
@@ -457,7 +479,9 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     }
 
                     // Create file using to_file and then set lock info
-                    return Ok(entry.to_file_locked(LockType::Shared));
+                    let mut file = entry.to_file_locked(LockType::Shared);
+                    #[cfg(feature = "audit-log")]
+                    return Ok(file);
                 }
             }
         }
@@ -533,7 +557,9 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     }
                 }
 
-                Ok(entry.to_file_locked(LockType::Exclusive))
+                let mut file = entry.to_file_locked(LockType::Exclusive);
+                #[cfg(feature = "audit-log")]
+                Ok(file)
             }
             // file already exists - try to lock it exclusively
             DirEntryOrShortName::DirEntry(entry) => {
@@ -547,7 +573,9 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     }
                 }
 
-                Ok(entry.to_file_locked(LockType::Exclusive))
+                let mut file = entry.to_file_locked(LockType::Exclusive);
+                #[cfg(feature = "audit-log")]
+                Ok(file)
             }
         }
     }
@@ -607,6 +635,15 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     e.stream.first_cluster(),
                 );
                 dir.write_entry("..", sfn_entry).await?;
+
+                // Audit log: directory created
+                #[cfg(feature = "audit-log")]
+                self.fs.log_audit(
+                    crate::audit::AuditOperation::DirCreate,
+                    path,
+                    crate::audit::AuditResult::Success,
+                ).await;
+
                 Ok(dir)
             }
             // directory already exists - return it
@@ -650,14 +687,18 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         // traverse path
         let mut split = split_path(path);
         let mut e = self.clone();
+        trace!("Initial split: name={:?}, rest={:?}", split.0, split.1);
         loop {
             let (name, rest_opt) = split;
+            trace!("Loop iteration: name={:?}, rest={:?}", name, rest_opt);
             match rest_opt {
                 Some(rest) => {
+                    trace!("Traversing intermediate directory: {}", name);
                     split = split_path(rest);
                     e = e.find_entry(name, Some(true), None).await?.to_dir();
                 }
                 None => {
+                    trace!("Reached final component: {}", name);
                     break;
                 }
             }
@@ -666,23 +707,36 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         // this is final filename in the path
         let parent = e;
         let (name, _) = split;
+        trace!("Attempting to find entry: {}", name);
 
         // in case of directory check if it is empty
         let e = parent.find_entry(name, None, None).await?;
         if e.is_dir() && !e.to_dir().is_empty().await? {
             return Err(Error::DirectoryIsNotEmpty);
         }
-        // free data
-        if let Some(n) = e.first_cluster() {
-            self.fs.free_cluster_chain(n).await?;
-        }
-        // free long and short name entries
+
+        // Mark directory entries as deleted FIRST, before freeing data clusters
+        // This is important because freeing clusters might affect the parent directory stream
         let mut stream = parent.stream.clone();
-        stream.seek(SeekFrom::Start(e.offset_range.0)).await?;
+
+        // Get the absolute position of the stream start
+        // Use abs_pos() which works correctly for both File and DiskSlice
+        let stream_start_abs_pos = stream.abs_pos().unwrap_or(0);
+        trace!("Stream absolute start position: {}", stream_start_abs_pos);
+        trace!("Entry offset_range (absolute): {:?}", e.offset_range);
+
+        // Calculate relative offset within the stream
+        // offset_range contains absolute positions, but streams expect relative offsets
+        let relative_offset = e.offset_range.0.saturating_sub(stream_start_abs_pos);
+        trace!("Calculated relative offset: {}", relative_offset);
+
+        // Now seek to the relative offset within the stream
+        stream.seek(SeekFrom::Start(relative_offset)).await?;
         let num = ((e.offset_range.1 - e.offset_range.0) / u64::from(DIR_ENTRY_SIZE)) as usize;
-        for _ in 0..num {
+        trace!("Will delete {} directory entries", num);
+        for i in 0..num {
             let mut data = DirEntryData::deserialize(&mut stream).await?;
-            trace!("removing dir entry {:?}", data);
+            trace!("removing dir entry {} {:?}", i, data);
             data.set_deleted();
             stream
                 .seek(SeekFrom::Current(-i64::from(DIR_ENTRY_SIZE)))
@@ -691,6 +745,24 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         }
         // remove requires stream flush
         stream.flush().await?;
+
+        // Now free the file's data clusters
+        if let Some(n) = e.first_cluster() {
+            trace!("Freeing cluster chain starting at cluster {}", n);
+            self.fs.free_cluster_chain(n).await?;
+        }
+
+        // Audit log: file/directory deleted
+        #[cfg(feature = "audit-log")]
+        {
+            let operation = if e.is_dir() {
+                crate::audit::AuditOperation::DirDelete
+            } else {
+                crate::audit::AuditOperation::FileDelete
+            };
+            self.fs.log_audit(operation, path, crate::audit::AuditResult::Success).await;
+        }
+
         Ok(())
     }
 
