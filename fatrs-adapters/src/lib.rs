@@ -93,6 +93,12 @@ pub use adapters::{
 #[cfg(feature = "alloc")]
 pub use adapters::{presets, HeapBuffer};
 
+#[cfg(feature = "embedded-storage")]
+pub use adapters::{NorFlashAdapter, NorFlashConfig, NorFlashError, NOR_FLASH_BLOCK_SIZE};
+
+#[cfg(feature = "embedded-storage")]
+pub use adapters::{HeaderRotatingDevice, HeaderRotationConfig, HEADER_ROTATION_BLOCK_SIZE};
+
 // Infrastructure layer exports
 pub use infrastructure::streaming::{StackPageStream, StreamError};
 

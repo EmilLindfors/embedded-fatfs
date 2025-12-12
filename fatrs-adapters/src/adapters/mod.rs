@@ -41,6 +41,12 @@ mod error;
 #[cfg(feature = "alloc")]
 mod heap_buffer;
 
+#[cfg(feature = "embedded-storage")]
+mod nor_flash_adapter;
+
+#[cfg(feature = "embedded-storage")]
+mod header_rotating_device;
+
 pub use block_device_adapter::BlockDeviceAdapter;
 pub use stack_buffer::{StackBuffer, StackBuffer2K, StackBuffer4K, StackBuffer8K, StackBuffer4KBlock4K, StackBuffer128KBlock128K};
 pub use error::AdapterError;
@@ -50,3 +56,9 @@ pub use heap_buffer::{HeapBuffer, presets};
 
 #[cfg(feature = "alloc")]
 pub use error::HeapAdapterError;
+
+#[cfg(feature = "embedded-storage")]
+pub use nor_flash_adapter::{NorFlashAdapter, NorFlashConfig, NorFlashError, NOR_FLASH_BLOCK_SIZE};
+
+#[cfg(feature = "embedded-storage")]
+pub use header_rotating_device::{HeaderRotatingDevice, HeaderRotationConfig, HEADER_ROTATION_BLOCK_SIZE};
