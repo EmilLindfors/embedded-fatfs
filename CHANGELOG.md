@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Configurable Block Sizes (2025-01-12)
+
+**Major enhancement** - The fatrs-adapters crate now supports configurable block sizes through const generics, enabling use with storage devices that have non-standard block sizes (e.g., 4096-byte blocks for modern SSDs or database page sizes).
+
+#### Changes to fatrs-adapters
+- **`PageConfig<const BLOCK_SIZE: usize>`**: Now generic over block size (previously hardcoded to 512 bytes)
+- **`PageBuffer<S, T, const BLOCK_SIZE: usize>`**: Supports any block size matching the underlying storage
+- **`BlockDeviceAdapter<D, const BLOCK_SIZE: usize>`**: Forwards block size from `BlockDevice` implementation
+- **`StackBuffer<D, const N: usize, const BLOCK_SIZE: usize>`**: Compile-time configurable block size
+- **`HeapBuffer<D, const BLOCK_SIZE: usize>`**: Runtime configurable block size
+- **`StackPageStream<D, const N: usize, const BLOCK_SIZE: usize>`**: Streaming with configurable blocks
+- **`HeapPageStream<D, const BLOCK_SIZE: usize>`**: Heap-based streaming with configurable blocks
+
+#### New Block Size Constants
+- `BLOCK_SIZE_512`: Standard 512-byte blocks (traditional storage)
+- `BLOCK_SIZE_4096`: 4KB blocks (modern SSDs, database pages)
+- `BLOCK_SIZE_128K`: 128KB blocks (high-performance SSDs)
+- `BLOCK_SIZE_256K`: 256KB blocks (NVMe SSDs)
+
+#### New Type Aliases
+- `StackBuffer4KBlock4K<D>`: Stack buffer with 4KB pages and 4KB blocks
+- `StackBuffer128KBlock128K<D>`: Stack buffer with 128KB pages and 128KB blocks
+
+#### Breaking Changes
+- Removed legacy type aliases `LargePageStream` and `PageStream` (use `HeapPageStream` and `StackPageStream` with explicit block size)
+- All adapters now require explicit block size const generic parameter matching the `BlockDevice` implementation
+
+#### Migration Guide
+```rust
+// Old (v0.4.0)
+use fatrs_adapters::LargePageStream;
+let stream = LargePageStream::new(device, page_size)?;
+
+// New (v0.5.0)
+use fatrs_adapters::HeapPageStream;
+let stream = HeapPageStream::new(device, page_size)?; // BLOCK_SIZE inferred from device
+```
+
+#### Use Cases
+- **Custom storage**: BTree databases with 4096-byte pages
+- **Modern SSDs**: Native 4KB sector sizes
+- **High-performance**: Large block sizes (128KB+) for sequential I/O
+- **Embedded**: Match hardware sector sizes exactly
+
+**Note**: Platform-specific block devices in `fatrs-block-platform` currently still use 512-byte blocks. To use different block sizes, implement a custom `BlockDevice<SIZE>` for your storage backend.
+
 ### Added - Hexagonal Architecture (2025-01-XX)
 
 **Major architectural refactoring** - The project has been restructured into a hexagonal architecture (ports and adapters pattern) with clean separation of concerns:
